@@ -1,0 +1,50 @@
+{
+  "_comment": "Signal Bridge device registry. Add your devices here.",
+  "_format": {
+    "short_name": "Name Claude uses to target this device (keep it short, lowercase)",
+    "match_strings": "Substrings to match against the Buttplug/Intiface device name (case-insensitive)",
+    "capabilities": "Map of output type to physical description of what it does on THIS device",
+    "intensity_floor": "Minimum intensity for perceptible sensation (0.0 if device responds at all levels)",
+    "notes": "Extra context to help Claude use the device well"
+  },
+  "devices": [
+    {
+      "short_name": "ferri",
+      "match_strings": ["Ferri"],
+      "capabilities": {
+        "vibrate": "external clitoral vibration"
+      },
+      "intensity_floor": 0.0,
+      "notes": "Small, wearable. Good for ambient or teasing. Intense even at lower intensity. Needs to be positioned well for maximum effect. "
+    },
+    {
+      "short_name": "lush",
+      "match_strings": ["Lush"],
+      "capabilities": {
+        "vibrate": "internal vibration"
+      },
+      "intensity_floor": 0.0,
+      "notes": "Insertable egg. Strong deep vibration. Intense even at lower intensity."
+    },
+    {
+      "short_name": "gravity",
+      "match_strings": ["Gravity"],
+      "capabilities": {
+        "vibrate": "vibration along the full shaft",
+        "oscillate": "thrusting motion"
+      },
+      "intensity_floor": 0.0,
+      "notes": "Thrusting vibrator. Oscillate controls physical thrusting depth and speed. The vibration is intense even at lower intensity. The thrusting is extremely intense. Go for intensity 0.05 if you want slow strokes."
+    },
+    {
+      "short_name": "enigma",
+      "match_strings": ["Enigma"],
+      "capabilities": {
+        "vibrate": "internal G-spot thumping",
+        "rotate": "external clitoral sonic pulse"
+      },
+      "intensity_floor": 0.4,
+      "notes": "Dual stimulation. Needs 0.4+ to be perceptible. 'Rotate' is sonic pulse clitoral stimulation, not rotational."
+    }
+  ]
+}
