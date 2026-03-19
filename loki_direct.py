@@ -31,6 +31,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import math
+import sqlite3
+
 def _maybe_reexec_into_venv() -> None:
     """
     Ensure `python3 loki_direct.py` uses the repo venv if present.
@@ -90,13 +93,18 @@ load_dotenv()
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 XAI_ENDPOINT = os.getenv("XAI_ENDPOINT", "https://api.x.ai/v1/chat/completions")
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning")
+XAI_EMBEDDING_MODEL = os.getenv("XAI_EMBEDDING_MODEL", "grok-embedding")
+XAI_EMBEDDINGS_ENDPOINT = os.getenv("XAI_EMBEDDINGS_ENDPOINT", "https://api.x.ai/v1/embeddings")
 
 INTIFACE_WS = os.getenv("INTIFACE_WS", "ws://127.0.0.1:12345")
 
 MEMORY_DIR = Path(os.getenv("LOKI_MEMORY_DIR", "memories")).resolve()
 PLUGINS_DIR = Path(os.getenv("LOKI_PLUGINS_DIR", "loki_plugins")).resolve()
+VECTOR_DB_PATH = Path(os.getenv("LOKI_VECTOR_DB_PATH", "loki_memory.sqlite3")).resolve()
+COMPILED_MEMORY_PATH = Path(os.getenv("LOKI_COMPILED_MEMORY_PATH", str(MEMORY_DIR / "compiled_memory.md"))).resolve()
 
 REQUEST_TIMEOUT_S = float(os.getenv("LOKI_HTTP_TIMEOUT_S", "60"))
+RETRIEVAL_K = int(os.getenv("LOKI_RETRIEVAL_K", "6"))
 
 
 # -----------------------------
@@ -176,6 +184,33 @@ def build_attachment_block(path: Path, max_text_chars: int = 120_000) -> Dict[st
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         }
     return {"type": "text", "text": f"[Attached file: {path.name} ({mime}) not supported for inline analysis yet]"}
+
+
+def looks_like_existing_path(s: str) -> Optional[Path]:
+    """
+    Heuristic: if user pastes a local path (maybe with escaped spaces), treat as an attach.
+    """
+
+    raw = s.strip()
+    if not raw:
+        return None
+    if raw.startswith("/attach "):
+        return None
+    if raw.startswith("~"):
+        raw = str(Path(raw).expanduser())
+    # Handle backslash-escaped spaces from shell copying.
+    raw = raw.replace("\\ ", " ")
+    # If they pasted something like: "/path/to/file.jpg " (with trailing punctuation)
+    raw = raw.strip().strip('"').strip("'").strip()
+    p = Path(raw)
+    if not p.is_absolute():
+        return None
+    try:
+        if p.exists() and p.is_file():
+            return p
+    except Exception:
+        return None
+    return None
 
 
 def ensure_plugins_package(plugins_dir: Path) -> None:
@@ -543,6 +578,19 @@ class XAIClient:
         if resp.status_code != 200:
             raise RuntimeError(f"xAI API error {resp.status_code}: {resp.text}")
         return resp.json()
+
+    def embed(self, texts: List[str], model: str, endpoint: str) -> List[List[float]]:
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload: Dict[str, Any] = {"model": model, "input": texts}
+        resp = requests.post(endpoint, headers=headers, json=payload, timeout=self.timeout_s)
+        if resp.status_code != 200:
+            raise RuntimeError(f"xAI embeddings error {resp.status_code}: {resp.text}")
+        data = resp.json()
+        items = data.get("data") or []
+        out: List[List[float]] = []
+        for it in items:
+            out.append(it.get("embedding") or [])
+        return out
 
 
 def extract_assistant_message(resp: Dict[str, Any]) -> Dict[str, Any]:
