@@ -123,16 +123,59 @@ def load_memories(folder: Path) -> Tuple[str, List[str]]:
     if not folder.is_dir():
         return "", [f"{folder} exists but is not a directory"]
 
-    exts = {".txt", ".md", ".markdown", ".json", ".yaml", ".yml"}
-    files = sorted([p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in exts])
-    if not files:
+    text_exts = {".txt", ".md", ".markdown", ".json", ".yaml", ".yml"}
+    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    text_files = sorted([p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in text_exts])
+    image_files = sorted([p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in image_exts])
+    if not text_files and not image_files:
         return "", []
 
     chunks: List[str] = []
-    for p in files:
-        rel = p.relative_to(folder)
-        chunks.append(f"### Memory: {rel}\n{safe_read_text(p)}")
+    if text_files:
+        for p in text_files:
+            rel = p.relative_to(folder)
+            chunks.append(f"### Memory (text): {rel}\n{safe_read_text(p)}")
+    if image_files:
+        manifest = "\n".join([f"- {p.relative_to(folder)}" for p in image_files])
+        chunks.append(
+            "### Memory (images manifest)\n"
+            "These image files exist in the memory folder. Use /attach <path> if you want me to analyze one.\n"
+            f"{manifest}"
+        )
     return "\n\n".join(chunks), []
+
+
+def guess_mime(path: Path) -> str:
+    ext = path.suffix.lower()
+    return {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".json": "application/json",
+        ".yaml": "text/yaml",
+        ".yml": "text/yaml",
+        ".pdf": "application/pdf",
+    }.get(ext, "application/octet-stream")
+
+
+def build_attachment_block(path: Path, max_text_chars: int = 120_000) -> Dict[str, Any]:
+    mime = guess_mime(path)
+    if mime.startswith("text/") or mime in {"application/json"}:
+        return {
+            "type": "text",
+            "text": f"[Attached file: {path.name}]\n{safe_read_text(path, max_chars=max_text_chars)}",
+        }
+    if mime.startswith("image/"):
+        b64 = b64_file(path)
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        }
+    return {"type": "text", "text": f"[Attached file: {path.name} ({mime}) not supported for inline analysis yet]"}
 
 
 def ensure_plugins_package(plugins_dir: Path) -> None:
@@ -737,6 +780,7 @@ def print_banner() -> None:
     print("Enter messages normally. Commands:")
     print("  /help")
     print("  /mem (reload memories)")
+    print("  /attach <path> (attach a text/image file for analysis)")
     print("  /tools (list tool names)")
     print("  /scan (scan Intiface devices)")
     print("  /upgrade <request>   (e.g. /upgrade add tts)")
@@ -833,6 +877,35 @@ def main() -> int:
             print(f"[memory] Reloaded {MEMORY_DIR}")
             continue
 
+        if user_in.startswith("/attach "):
+            raw = user_in[len("/attach ") :].strip().strip('"').strip("'")
+            if not raw:
+                print("Usage: /attach <path>")
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                p = (Path.cwd() / p).resolve()
+            if not p.exists() or not p.is_file():
+                print(f"[attach] Not found: {p}")
+                continue
+            try:
+                block = build_attachment_block(p)
+            except Exception as e:
+                print(f"[attach] Failed: {e}")
+                continue
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analyze the attached file and respond."},
+                        block,
+                    ],
+                }
+            )
+            print(f"[attach] Attached {p.name}")
+            # fall through to run the normal chat logic below, but skip adding user_in again
+            user_in = ""
+
         if user_in.startswith("/upgrade "):
             request_text = user_in[len("/upgrade ") :].strip()
             if not request_text:
@@ -854,7 +927,8 @@ def main() -> int:
             continue
 
         # Normal chat turn (with tool calling)
-        messages.append({"role": "user", "content": user_in})
+        if user_in:
+            messages.append({"role": "user", "content": user_in})
 
         try:
             resp = xai.chat(messages, tools=tools.list_specs_for_model())
