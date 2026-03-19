@@ -292,7 +292,7 @@ class ButtplugController:
             from buttplug import DeviceOutputCommand, OutputType
 
             cmd = DeviceOutputCommand(OutputType.VIBRATE, intensity)
-            dev.run_output(cmd)
+            await dev.run_output(cmd)
             if duration_s > 0:
                 await asyncio.sleep(duration_s)
                 await dev.stop()
