@@ -96,6 +96,8 @@ XAI_ENDPOINT = os.getenv("XAI_ENDPOINT", "https://api.x.ai/v1/chat/completions")
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning")
 XAI_EMBEDDING_MODEL = os.getenv("XAI_EMBEDDING_MODEL", "grok-embedding")
 XAI_EMBEDDINGS_ENDPOINT = os.getenv("XAI_EMBEDDINGS_ENDPOINT", "https://api.x.ai/v1/embeddings")
+XAI_VISION_MODEL = os.getenv("XAI_VISION_MODEL", "grok-4.20-beta-latest-non-reasoning")
+XAI_RESPONSES_ENDPOINT = os.getenv("XAI_RESPONSES_ENDPOINT", "https://api.x.ai/v1/responses")
 
 INTIFACE_WS = os.getenv("INTIFACE_WS", "ws://127.0.0.1:12345")
 
@@ -117,7 +119,7 @@ LOKI_SCREENSHOT_ON_ERROR_BLANK = os.getenv("LOKI_SCREENSHOT_ON_ERROR_BLANK", "0"
     "yes",
     "on",
 }
-_BLANK_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xh0sAAAAASUVORK5CYII="
+_BLANK_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg=="
 
 
 # -----------------------------
@@ -187,7 +189,7 @@ def build_attachment_block(path: Path, max_text_chars: int = 120_000) -> Dict[st
     mime = guess_mime(path)
     if mime.startswith("text/") or mime in {"application/json"}:
         return {
-            "type": "text",
+            "type": "input_text",
             "text": f"[Attached file: {path.name}]\n{safe_read_text(path, max_chars=max_text_chars)}",
         }
     if mime == "application/pdf":
@@ -209,18 +211,19 @@ def build_attachment_block(path: Path, max_text_chars: int = 120_000) -> Dict[st
             if len(joined) > max_text_chars:
                 joined = joined[:max_text_chars] + "\n[...truncated...]\n"
             return {
-                "type": "text",
+                "type": "input_text",
                 "text": f"[Attached PDF: {path.name}]\n{joined}",
             }
         except Exception as e:
-            return {"type": "text", "text": f"[Attached PDF: {path.name}] (failed to extract text: {e})"}
+            return {"type": "input_text", "text": f"[Attached PDF: {path.name}] (failed to extract text: {e})"}
     if mime.startswith("image/"):
         b64 = b64_file(path)
         return {
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{b64}"},
+            "type": "input_image",
+            "image_url": f"data:{mime};base64,{b64}",
+            "detail": "high",
         }
-    return {"type": "text", "text": f"[Attached file: {path.name} ({mime}) not supported for inline analysis yet]"}
+    return {"type": "input_text", "text": f"[Attached file: {path.name} ({mime}) not supported for inline analysis yet]"}
 
 
 def looks_like_existing_path(s: str) -> Optional[Path]:
@@ -780,6 +783,49 @@ def extract_assistant_message(resp: Dict[str, Any]) -> Dict[str, Any]:
     return msg
 
 
+def extract_responses_text(resp_json: Dict[str, Any]) -> str:
+    out: List[str] = []
+    for item in resp_json.get("output") or []:
+        for content in item.get("content") or []:
+            if content.get("type") == "output_text":
+                t = content.get("text") or ""
+                if t:
+                    out.append(str(t))
+    if out:
+        return "\n".join(out).strip()
+    return ""
+
+
+def analyze_images_with_xai_responses(
+    api_key: str,
+    image_data_urls: List[str],
+    prompt: str,
+    *,
+    max_output_tokens: int = 320,
+    timeout_s: float = 120.0,
+) -> str:
+    """
+    Use xAI Responses API for image understanding.
+    We feed the images and prompt as `input` content parts.
+    """
+    if not image_data_urls:
+        return ""
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    content_parts: List[Dict[str, Any]] = []
+    for url in image_data_urls[:LOKI_MAX_SCREENSHOT_IMAGES]:
+        content_parts.append({"type": "input_image", "image_url": url, "detail": "high"})
+    content_parts.append({"type": "input_text", "text": prompt})
+    payload = {
+        "model": XAI_VISION_MODEL,
+        "input": [{"role": "user", "content": content_parts}],
+        "max_output_tokens": int(max_output_tokens),
+    }
+    resp = requests.post(XAI_RESPONSES_ENDPOINT, headers=headers, json=payload, timeout=timeout_s)
+    if resp.status_code != 200:
+        return f"[image analysis failed {resp.status_code}] {resp.text[:500]}"
+    return extract_responses_text(resp.json()) or "[image analysis returned no text]"
+
+
 def extract_image_data_urls(tool_result: str) -> List[str]:
     """
     Parse data URLs like: data:image/png;base64,...
@@ -1021,15 +1067,16 @@ def ingest_one_path(xai: XAIClient, vstore: VectorMemoryStore, fp: Path) -> None
         # Best-effort caption; if unavailable, store a placeholder.
         try:
             block = build_attachment_block(fp)
-            caption_msgs = [
-                {"role": "system", "content": "Describe the attached image in detail for memory indexing."},
-                {"role": "user", "content": [{"type": "text", "text": "Describe this image."}, block]},
-            ]
-            cap_resp = xai.chat(caption_msgs, tools=None)
-            cap_msg = extract_assistant_message(cap_resp)
-            cap = cap_msg.get("content") or ""
-            if isinstance(cap, list):
-                cap = "\n".join([part.get("text", "") for part in cap if isinstance(part, dict)])
+            if block.get("type") == "input_image":
+                img_url = block.get("image_url")
+                cap = analyze_images_with_xai_responses(
+                    xai.api_key,
+                    [str(img_url)],
+                    f"Describe the attached image ({fp.name}) for long-term memory indexing. Extract any readable text verbatim and describe important visible UI/context.",
+                    max_output_tokens=420,
+                )
+            else:
+                cap = "(image present; caption unavailable)"
         except Exception:
             cap = "(image present; caption unavailable)"
         text_for_store = f"[Image: {fp.name}]\n{cap}"
@@ -1608,15 +1655,28 @@ def main() -> int:
             except Exception as e:
                 print(f"[attach] Failed: {e}")
                 continue
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Analyze the attached file and respond."},
-                        block,
-                    ],
-                }
-            )
+
+            # Chat completions isn't reliably multimodal here, so we route images through
+            # the Responses API and then feed the resulting text back into chat.
+            if block.get("type") == "input_image":
+                img_url = block.get("image_url")
+                analysis = analyze_images_with_xai_responses(
+                    xai.api_key,
+                    [str(img_url)],
+                    f"Analyze the attached image ({p.name}). Extract any readable text and describe important visible UI elements.",
+                    max_output_tokens=420,
+                )
+                messages.append({"role": "user", "content": f"[Image analysis: {p.name}]\n{analysis}"})
+            else:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Analyze the attached file and respond."},
+                            block,
+                        ],
+                    }
+                )
             print(f"[attach] Attached {p.name}")
             # fall through to run the normal chat logic below, but skip adding user_in again
             user_in = ""
@@ -1700,6 +1760,25 @@ def main() -> int:
                 except Exception:
                     args = {}
                 result = run_tool_call(tools, str(tool_name), args if isinstance(args, dict) else {})
+                if tool_name in {"screenshot_monitor_base64", "screenshot_all_monitors_base64"}:
+                    img_urls = extract_image_data_urls(result)
+                    if img_urls:
+                        if tool_name == "screenshot_monitor_base64" and isinstance(args, dict):
+                            mi = args.get("monitor_index")
+                            prompt = f"You are viewing a screenshot of desktop monitor index {mi}. Describe all visible text and important UI elements. Quote readable text as closely as possible."
+                        else:
+                            prompt = (
+                                "You are viewing screenshots of multiple desktop monitors provided in order. "
+                                "For each image in order, describe visible text and important UI elements. "
+                                "Quote readable text as closely as possible."
+                            )
+                        result = analyze_images_with_xai_responses(
+                            xai.api_key,
+                            img_urls,
+                            prompt,
+                            max_output_tokens=360,
+                        )
+
                 messages.append(
                     {
                         "role": "tool",
@@ -1708,20 +1787,6 @@ def main() -> int:
                         "content": result,
                     }
                 )
-
-                # If a tool returned a screenshot as a data URL, inject it into the next model call
-                # as a real `image_url` input (so the model can analyze it).
-                img_urls = extract_image_data_urls(result)
-                if img_urls:
-                    label = tool_name
-                    if tool_name == "screenshot_monitor_base64" and isinstance(args, dict):
-                        label = f"screenshot_monitor_base64 (monitor_index={args.get('monitor_index')})"
-                    elif tool_name == "screenshot_all_monitors_base64":
-                        label = "screenshot_all_monitors_base64"
-                    content_parts: List[Dict[str, Any]] = [{"type": "text", "text": f"{label} provided desktop images."}]
-                    for u in img_urls:
-                        content_parts.append({"type": "image_url", "image_url": {"url": u}})
-                    messages.append({"role": "user", "content": content_parts})
 
             try:
                 resp = xai.chat(messages, tools=tools.list_specs_for_model())
