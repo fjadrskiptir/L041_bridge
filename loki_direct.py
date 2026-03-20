@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import math
 import sqlite3
+import hashlib
 
 def _maybe_reexec_into_venv() -> None:
     """
@@ -102,9 +103,13 @@ MEMORY_DIR = Path(os.getenv("LOKI_MEMORY_DIR", "memories")).resolve()
 PLUGINS_DIR = Path(os.getenv("LOKI_PLUGINS_DIR", "loki_plugins")).resolve()
 VECTOR_DB_PATH = Path(os.getenv("LOKI_VECTOR_DB_PATH", "loki_memory.sqlite3")).resolve()
 COMPILED_MEMORY_PATH = Path(os.getenv("LOKI_COMPILED_MEMORY_PATH", str(MEMORY_DIR / "compiled_memory.md"))).resolve()
+INBOX_DIR = Path(os.getenv("LOKI_INBOX_DIR", str(MEMORY_DIR / "inbox"))).resolve()
+PROCESSED_DIR = Path(os.getenv("LOKI_PROCESSED_DIR", str(MEMORY_DIR / "processed"))).resolve()
 
 REQUEST_TIMEOUT_S = float(os.getenv("LOKI_HTTP_TIMEOUT_S", "60"))
 RETRIEVAL_K = int(os.getenv("LOKI_RETRIEVAL_K", "6"))
+WATCH_MEMORY_FOLDER = os.getenv("LOKI_WATCH_MEMORY_FOLDER", "1").strip() not in {"0", "false", "False", "no", "NO"}
+WATCH_POLL_S = float(os.getenv("LOKI_WATCH_POLL_S", "2.0"))
 
 
 # -----------------------------
@@ -177,6 +182,30 @@ def build_attachment_block(path: Path, max_text_chars: int = 120_000) -> Dict[st
             "type": "text",
             "text": f"[Attached file: {path.name}]\n{safe_read_text(path, max_chars=max_text_chars)}",
         }
+    if mime == "application/pdf":
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(str(path))
+            pages_text: List[str] = []
+            for i, page in enumerate(reader.pages[:50]):
+                try:
+                    t = page.extract_text() or ""
+                except Exception:
+                    t = ""
+                if t.strip():
+                    pages_text.append(f"--- Page {i+1} ---\n{t.strip()}")
+            joined = "\n\n".join(pages_text).strip()
+            if not joined:
+                joined = "[PDF had no extractable text.]"
+            if len(joined) > max_text_chars:
+                joined = joined[:max_text_chars] + "\n[...truncated...]\n"
+            return {
+                "type": "text",
+                "text": f"[Attached PDF: {path.name}]\n{joined}",
+            }
+        except Exception as e:
+            return {"type": "text", "text": f"[Attached PDF: {path.name}] (failed to extract text: {e})"}
     if mime.startswith("image/"):
         b64 = b64_file(path)
         return {
@@ -211,6 +240,44 @@ def looks_like_existing_path(s: str) -> Optional[Path]:
     except Exception:
         return None
     return None
+
+
+def iter_supported_files(root: Path, *, exclude_inbox: bool = True) -> List[Path]:
+    ok_exts = {
+        ".txt",
+        ".md",
+        ".markdown",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".gif",
+        ".pdf",
+    }
+    out: List[Path] = []
+    try:
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.name.startswith("."):
+                continue
+            if p.resolve() == COMPILED_MEMORY_PATH:
+                continue
+            if exclude_inbox:
+                # Avoid ingesting inbox files via generic folder ingest; they should be processed/moved first.
+                try:
+                    if INBOX_DIR in p.resolve().parents:
+                        continue
+                except Exception:
+                    pass
+            if p.suffix.lower() in ok_exts:
+                out.append(p)
+    except Exception:
+        return []
+    return out
 
 
 def ensure_plugins_package(plugins_dir: Path) -> None:
@@ -619,6 +686,341 @@ def run_tool_call(tools: ToolRegistry, tool_name: str, args: Dict[str, Any]) -> 
 
 
 # -----------------------------
+# Vector memory (SQLite)
+# -----------------------------
+
+def _cosine_sim(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return -1.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0 or nb <= 0:
+        return -1.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+def embed_local(texts: List[str], dim: int = 768) -> List[List[float]]:
+    """
+    Dependency-free embedding fallback (hashed bag-of-words).
+    Not as strong as model embeddings, but works for local retrieval.
+    """
+
+    out: List[List[float]] = []
+    for t in texts:
+        v = [0.0] * dim
+        # Simple tokenization
+        tokens = re.findall(r"[A-Za-z0-9_]{2,}", t.lower())
+        if not tokens:
+            out.append(v)
+            continue
+        for tok in tokens:
+            h = hashlib.blake2b(tok.encode("utf-8"), digest_size=8).digest()
+            idx = int.from_bytes(h[:4], "little") % dim
+            sign = 1.0 if (h[4] & 1) == 0 else -1.0
+            v[idx] += sign
+        # L2 normalize
+        n = math.sqrt(sum(x * x for x in v))
+        if n > 0:
+            v = [x / n for x in v]
+        out.append(v)
+    return out
+
+
+def embed_texts(xai: XAIClient, texts: List[str]) -> List[List[float]]:
+    """
+    Try xAI embeddings first; fall back to local embeddings if unavailable.
+    """
+
+    try:
+        embs = xai.embed(texts, model=XAI_EMBEDDING_MODEL, endpoint=XAI_EMBEDDINGS_ENDPOINT)
+        if embs and all(isinstance(e, list) and e for e in embs):
+            return embs
+    except Exception:
+        pass
+    return embed_local(texts)
+
+
+def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 120) -> List[str]:
+    text = text.replace("\r\n", "\n")
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunks: List[str] = []
+    buf = ""
+    for p in paras:
+        if not buf:
+            buf = p
+            continue
+        if len(buf) + 2 + len(p) <= max_chars:
+            buf = buf + "\n\n" + p
+        else:
+            chunks.append(buf)
+            buf = p
+    if buf:
+        chunks.append(buf)
+
+    # Simple overlap on character tail
+    if overlap > 0 and len(chunks) > 1:
+        out: List[str] = []
+        prev_tail = ""
+        for c in chunks:
+            out.append((prev_tail + c).strip())
+            prev_tail = c[-overlap:]
+        return out
+    return chunks
+
+
+class VectorMemoryStore:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+
+    def _init_db(self) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_path TEXT NOT NULL,
+                    mime TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    embedding_json TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source_path);")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def upsert_chunks(self, source_path: str, mime: str, texts: List[str], embeddings: List[List[float]]) -> int:
+        if len(texts) != len(embeddings):
+            raise ValueError("texts/embeddings length mismatch")
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM chunks WHERE source_path = ?", (source_path,))
+            now = time.time()
+            rows = 0
+            for i, (t, emb) in enumerate(zip(texts, embeddings)):
+                conn.execute(
+                    "INSERT INTO chunks(source_path,mime,chunk_index,text,embedding_json,created_at) VALUES (?,?,?,?,?,?)",
+                    (source_path, mime, i, t, json.dumps(emb), now),
+                )
+                rows += 1
+            conn.commit()
+            return rows
+        finally:
+            conn.close()
+
+    def search(self, query_embedding: List[float], k: int = 6) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            cur = conn.execute("SELECT source_path,mime,chunk_index,text,embedding_json FROM chunks")
+            scored: List[Tuple[float, Dict[str, Any]]] = []
+            for source_path, mime, chunk_index, text, emb_json in cur.fetchall():
+                try:
+                    emb = json.loads(emb_json)
+                except Exception:
+                    continue
+                score = _cosine_sim(query_embedding, emb)
+                scored.append(
+                    (
+                        score,
+                        {
+                            "source_path": source_path,
+                            "mime": mime,
+                            "chunk_index": chunk_index,
+                            "text": text,
+                            "score": score,
+                        },
+                    )
+                )
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [d for _s, d in scored[: max(1, k)] if d["score"] > 0]
+        finally:
+            conn.close()
+
+    def export_compiled_markdown(self, out_path: Path, limit_chars_per_chunk: int = 4000) -> None:
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "SELECT source_path,mime,chunk_index,text,created_at FROM chunks ORDER BY source_path, chunk_index"
+            )
+            lines: List[str] = ["# Loki Compiled Memory", ""]
+            current = None
+            for source_path, mime, chunk_index, text, created_at in cur.fetchall():
+                if source_path != current:
+                    current = source_path
+                    lines.append(f"## {source_path}")
+                    lines.append(f"- mime: `{mime}`")
+                    lines.append(f"- updated: `{time.ctime(created_at)}`")
+                    lines.append("")
+                if len(text) > limit_chars_per_chunk:
+                    text = text[:limit_chars_per_chunk] + "\n[...truncated...]\n"
+                lines.append(f"### Chunk {chunk_index}")
+                lines.append(text)
+                lines.append("")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("\n".join(lines), encoding="utf-8")
+        finally:
+            conn.close()
+
+
+def ingest_one_path(xai: XAIClient, vstore: VectorMemoryStore, fp: Path) -> None:
+    mime = guess_mime(fp)
+    if mime.startswith("image/"):
+        # Best-effort caption; if unavailable, store a placeholder.
+        try:
+            block = build_attachment_block(fp)
+            caption_msgs = [
+                {"role": "system", "content": "Describe the attached image in detail for memory indexing."},
+                {"role": "user", "content": [{"type": "text", "text": "Describe this image."}, block]},
+            ]
+            cap_resp = xai.chat(caption_msgs, tools=None)
+            cap_msg = extract_assistant_message(cap_resp)
+            cap = cap_msg.get("content") or ""
+            if isinstance(cap, list):
+                cap = "\n".join([part.get("text", "") for part in cap if isinstance(part, dict)])
+        except Exception:
+            cap = "(image present; caption unavailable)"
+        text_for_store = f"[Image: {fp.name}]\n{cap}"
+        chunks = _chunk_text(text_for_store)
+    elif mime == "application/pdf":
+        # Extract text for indexing
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(str(fp))
+            pages_text: List[str] = []
+            for i, page in enumerate(reader.pages[:80]):
+                try:
+                    t = page.extract_text() or ""
+                except Exception:
+                    t = ""
+                if t.strip():
+                    pages_text.append(f"--- Page {i+1} ---\n{t.strip()}")
+            text_for_store = "\n\n".join(pages_text).strip() or "[PDF had no extractable text.]"
+        except Exception as e:
+            text_for_store = f"[PDF extraction failed: {e}]"
+        chunks = _chunk_text(f"[PDF: {fp.name}]\n{text_for_store}")
+    else:
+        text_for_store = safe_read_text(fp)
+        chunks = _chunk_text(text_for_store)
+
+    embs = embed_texts(xai, chunks)
+    vstore.upsert_chunks(str(fp), mime=mime, texts=chunks, embeddings=embs)
+
+
+class MemoryFolderWatcher:
+    def __init__(self, inbox_dir: Path, processed_dir: Path, poll_s: float, xai: XAIClient, vstore: VectorMemoryStore):
+        self.inbox_dir = inbox_dir
+        self.processed_dir = processed_dir
+        self.poll_s = float(max(0.5, min(30.0, poll_s)))
+        self.xai = xai
+        self.vstore = vstore
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._seen: Dict[str, Tuple[float, int]] = {}
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        try:
+            self.inbox_dir.mkdir(parents=True, exist_ok=True)
+            self.processed_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        self._thread = threading.Thread(target=self._run, name="memory-watcher", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def _snapshot(self) -> Dict[str, Tuple[float, int]]:
+        snap: Dict[str, Tuple[float, int]] = {}
+        # Only watch inbox; processed is treated as immutable source-of-truth.
+        for fp in iter_supported_files(self.inbox_dir, exclude_inbox=False):
+            try:
+                st = fp.stat()
+                snap[str(fp)] = (st.st_mtime, st.st_size)
+            except Exception:
+                continue
+        return snap
+
+    def _wait_until_stable(self, fp: Path, checks: int = 3, delay_s: float = 0.4) -> bool:
+        """
+        Avoid ingesting half-copied files by waiting for stable (mtime,size).
+        """
+
+        last = None
+        for _ in range(max(1, checks)):
+            try:
+                st = fp.stat()
+                sig = (st.st_mtime, st.st_size)
+            except Exception:
+                return False
+            if last is not None and sig == last:
+                return True
+            last = sig
+            time.sleep(delay_s)
+        return False
+
+    def _unique_processed_path(self, fp: Path) -> Path:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        base = fp.stem
+        ext = fp.suffix
+        candidate = self.processed_dir / f"{ts}_{base}{ext}"
+        i = 1
+        while candidate.exists():
+            candidate = self.processed_dir / f"{ts}_{base}_{i}{ext}"
+            i += 1
+        return candidate
+
+    def _run(self) -> None:
+        # Initial snapshot
+        self._seen = self._snapshot()
+        while not self._stop.is_set():
+            time.sleep(self.poll_s)
+            snap = self._snapshot()
+            changed = []
+            for path_str, sig in snap.items():
+                if self._seen.get(path_str) != sig:
+                    changed.append(Path(path_str))
+            if changed:
+                for fp in sorted(changed):
+                    try:
+                        if not fp.exists() or not fp.is_file():
+                            continue
+                        if not self._wait_until_stable(fp):
+                            continue
+                        target = self._unique_processed_path(fp)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        fp.replace(target)
+                        ingest_one_path(self.xai, self.vstore, target)
+                        print(f"[watch] Processed+ingested: {target.name}")
+                    except Exception as e:
+                        print(f"[watch] Failed {fp.name}: {e}")
+                try:
+                    self.vstore.export_compiled_markdown(COMPILED_MEMORY_PATH)
+                except Exception as e:
+                    print(f"[watch] Compile failed: {e}")
+            self._seen = snap
+
+
+# -----------------------------
 # Self-upgrade (plugin generation)
 # -----------------------------
 
@@ -829,6 +1231,9 @@ def print_banner() -> None:
     print("  /help")
     print("  /mem (reload memories)")
     print("  /attach <path> (attach a text/image file for analysis)")
+    print("  /ingest <path> (add file/folder into vector memory)")
+    print("  /compile_mem (write compiled memory document)")
+    print(f"  drop files into: {INBOX_DIR} (auto-moves to {PROCESSED_DIR})")
     print("  /tools (list tool names)")
     print("  /scan (scan Intiface devices)")
     print("  /upgrade <request>   (e.g. /upgrade add tts)")
@@ -868,6 +1273,12 @@ def main() -> int:
         print(f"[plugin] {msg}")
 
     xai = XAIClient(XAI_API_KEY, XAI_ENDPOINT, XAI_MODEL, timeout_s=REQUEST_TIMEOUT_S)
+    vstore = VectorMemoryStore(VECTOR_DB_PATH)
+    watcher: Optional[MemoryFolderWatcher] = None
+    if WATCH_MEMORY_FOLDER:
+        watcher = MemoryFolderWatcher(INBOX_DIR, PROCESSED_DIR, WATCH_POLL_S, xai=xai, vstore=vstore)
+        watcher.start()
+        print(f"[watch] Watching inbox {INBOX_DIR} (poll {WATCH_POLL_S:.1f}s)")
 
     base_system = (
         "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
@@ -900,6 +1311,11 @@ def main() -> int:
         if user_in.lower() in {"/quit", "quit", "exit"}:
             break
 
+        # If they paste a real file path, treat it like /attach automatically.
+        autop = looks_like_existing_path(user_in)
+        if autop:
+            user_in = f"/attach {autop}"
+
         if user_in == "/help":
             print_banner()
             continue
@@ -923,6 +1339,56 @@ def main() -> int:
                 base_system2 += "\nUser memory (treat as true unless contradicted):\n" + memory_text
             messages = [{"role": "system", "content": base_system2}] + [m for m in messages if m.get("role") != "system"][0:]
             print(f"[memory] Reloaded {MEMORY_DIR}")
+            continue
+
+        if user_in.startswith("/ingest "):
+            raw = user_in[len("/ingest ") :].strip().strip('"').strip("'").replace("\\ ", " ")
+            if not raw:
+                print("Usage: /ingest <path>")
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                p = (Path.cwd() / p).resolve()
+            if not p.exists():
+                print(f"[ingest] Not found: {p}")
+                continue
+
+            # Collect files
+            files: List[Path] = []
+            if p.is_file():
+                files = [p]
+            else:
+                # ingest common text + images
+                files = iter_supported_files(p)
+
+            if not files:
+                print("[ingest] No supported files found.")
+                continue
+
+            ingested = 0
+            failed = 0
+            for fp in sorted(files):
+                try:
+                    ingest_one_path(xai, vstore, fp)
+                    ingested += 1
+                except Exception as e:
+                    failed += 1
+                    print(f"[ingest] Failed {fp.name}: {e}")
+
+            try:
+                vstore.export_compiled_markdown(COMPILED_MEMORY_PATH)
+            except Exception as e:
+                print(f"[compile] Failed: {e}")
+
+            print(f"[ingest] Done. Files ingested: {ingested}, failed: {failed}. Compiled: {COMPILED_MEMORY_PATH}")
+            continue
+
+        if user_in == "/compile_mem":
+            try:
+                vstore.export_compiled_markdown(COMPILED_MEMORY_PATH)
+                print(f"[compile] Wrote {COMPILED_MEMORY_PATH}")
+            except Exception as e:
+                print(f"[compile] Failed: {e}")
             continue
 
         if user_in.startswith("/attach "):
@@ -974,9 +1440,33 @@ def main() -> int:
                 print(f"[upgrade] Failed: {e}")
             continue
 
+        # Retrieval: embed the user's text and attach top-k relevant chunks.
+        retrieved_block = ""
+        if user_in:
+            try:
+                qemb = embed_texts(xai, [user_in])[0]
+                hits = vstore.search(qemb, k=RETRIEVAL_K)
+                if hits:
+                    parts = []
+                    for h in hits:
+                        parts.append(
+                            f"- score={h['score']:.3f} source={h['source_path']} chunk={h['chunk_index']}\n{h['text']}"
+                        )
+                    retrieved_block = "Retrieved memory:\n" + "\n\n".join(parts)
+            except Exception:
+                retrieved_block = ""
+
         # Normal chat turn (with tool calling)
         if user_in:
-            messages.append({"role": "user", "content": user_in})
+            if retrieved_block:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"{user_in}\n\n---\n{retrieved_block}",
+                    }
+                )
+            else:
+                messages.append({"role": "user", "content": user_in})
 
         try:
             resp = xai.chat(messages, tools=tools.list_specs_for_model())
@@ -1035,6 +1525,11 @@ def main() -> int:
 
     try:
         butt.stop_device("nora")
+    except Exception:
+        pass
+    try:
+        if watcher:
+            watcher.stop()
     except Exception:
         pass
     butt.stop()
