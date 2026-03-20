@@ -110,6 +110,14 @@ REQUEST_TIMEOUT_S = float(os.getenv("LOKI_HTTP_TIMEOUT_S", "60"))
 RETRIEVAL_K = int(os.getenv("LOKI_RETRIEVAL_K", "6"))
 WATCH_MEMORY_FOLDER = os.getenv("LOKI_WATCH_MEMORY_FOLDER", "1").strip() not in {"0", "false", "False", "no", "NO"}
 WATCH_POLL_S = float(os.getenv("LOKI_WATCH_POLL_S", "2.0"))
+LOKI_MAX_SCREENSHOT_IMAGES = int(os.getenv("LOKI_MAX_SCREENSHOT_IMAGES", "4"))
+LOKI_SCREENSHOT_ON_ERROR_BLANK = os.getenv("LOKI_SCREENSHOT_ON_ERROR_BLANK", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_BLANK_PNG_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xh0sAAAAASUVORK5CYII="
 
 
 # -----------------------------
@@ -480,6 +488,108 @@ class ScreenController:
         except Exception as e:
             raise RuntimeError(f"pyautogui import failed: {e}")
 
+    def _get_mss(self):
+        import mss  # type: ignore
+
+        return mss.mss()
+
+    def monitors(self) -> List[Dict[str, Any]]:
+        """
+        Return monitor list with stable indices for user/model selection.
+        Indices are 0..N-1 corresponding to mss.monitors[1:].
+        """
+        try:
+            with self._get_mss() as sct:
+                mons = []
+                for i, m in enumerate(sct.monitors[1:]):
+                    mons.append(
+                        {
+                            "index": i,
+                            "left": int(m.get("left", 0)),
+                            "top": int(m.get("top", 0)),
+                            "width": int(m.get("width", 0)),
+                            "height": int(m.get("height", 0)),
+                            "name": m.get("name") or f"monitor_{i}",
+                        }
+                    )
+                if mons:
+                    return mons
+        except Exception:
+            pass
+
+        # Fallback: treat the primary screen as a single monitor.
+        import pyautogui
+
+        w, h = pyautogui.size()
+        return [{"index": 0, "left": 0, "top": 0, "width": int(w), "height": int(h), "name": "primary"}]
+
+    def _capture_monitor_png_bytes(self, monitor_index: int, max_dim: int = 1600) -> bytes:
+        """
+        Capture a single monitor to PNG bytes, optionally downscaling for smaller payloads.
+        """
+        max_dim = int(max(256, min(4096, max_dim)))
+        from io import BytesIO
+
+        from PIL import Image
+
+        mi = int(monitor_index)
+        if mi < 0:
+            mi = 0
+
+        try:
+            with self._get_mss() as sct:
+                # mss uses index 1..N-1 for real monitors; 0 is "all monitors"
+                mons = sct.monitors[1:]
+                if mons:
+                    if mi >= len(mons):
+                        mi = len(mons) - 1
+
+                    mon = mons[mi]
+                    img = sct.grab(mon)  # BGRA
+                    # Create RGB image from raw bytes
+                    pil_img = Image.frombytes("RGB", img.size, img.rgb)
+                else:
+                    raise RuntimeError("mss returned no monitors")
+        except Exception:
+            # Fallback: capture using pyautogui (typically primary screen only).
+            import pyautogui
+
+            pil_img = pyautogui.screenshot()
+
+            # Downscale to keep payload size reasonable
+        # Downscale to keep payload size reasonable
+        w, h = pil_img.size
+        scale = min(1.0, float(max_dim) / max(w, h))
+        if scale < 1.0:
+            pil_img = pil_img.resize((int(w * scale), int(h * scale)))
+
+        out = BytesIO()
+        pil_img.save(out, format="PNG")
+        return out.getvalue()
+
+    def screenshot_monitor_base64(self, monitor_index: int, max_dim: int = 1600) -> str:
+        try:
+            b = self._capture_monitor_png_bytes(monitor_index, max_dim=max_dim)
+            b64 = base64.b64encode(b).decode("ascii")
+            return f"data:image/png;base64,{b64}"
+        except Exception as e:
+            if LOKI_SCREENSHOT_ON_ERROR_BLANK:
+                return _BLANK_PNG_DATA_URL
+            return f"[screenshot_monitor_base64 failed: {e}]"
+
+    def screenshot_monitor(self, monitor_index: int, max_dim: int = 1600) -> str:
+        b = self._capture_monitor_png_bytes(monitor_index, max_dim=max_dim)
+        path = Path(tempfile.mkstemp(prefix="loki_m", suffix=".png")[1]).resolve()
+        path.write_bytes(b)
+        return str(path)
+
+    def screenshot_all_monitors_base64(self, max_dim: int = 1600) -> Dict[str, Any]:
+        images: List[str] = []
+        mons = self.monitors()
+        for mi in range(len(mons)):
+            images.append(self.screenshot_monitor_base64(mi, max_dim=max_dim))
+        return {"images": images, "count": len(images)}
+
     def click(self, x: int, y: int, button: str = "left") -> str:
         import pyautogui
 
@@ -668,6 +778,34 @@ def extract_assistant_message(resp: Dict[str, Any]) -> Dict[str, Any]:
     if not msg:
         return {"role": "assistant", "content": "[Empty message]"}
     return msg
+
+
+def extract_image_data_urls(tool_result: str) -> List[str]:
+    """
+    Parse data URLs like: data:image/png;base64,...
+    from tool results.
+    """
+    s = str(tool_result).strip()
+    urls: List[str] = []
+    if s.startswith("data:image/"):
+        urls.append(s)
+        return urls[:LOKI_MAX_SCREENSHOT_IMAGES]
+    try:
+        data = json.loads(s)
+    except Exception:
+        return []
+
+    if isinstance(data, dict) and isinstance(data.get("images"), list):
+        for item in data["images"]:
+            if isinstance(item, str) and item.startswith("data:image/"):
+                urls.append(item)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, str) and item.startswith("data:image/"):
+                urls.append(item)
+    elif isinstance(data, str) and data.startswith("data:image/"):
+        urls.append(data)
+    return urls[:LOKI_MAX_SCREENSHOT_IMAGES]
 
 
 def run_tool_call(tools: ToolRegistry, tool_name: str, args: Dict[str, Any]) -> str:
@@ -1222,6 +1360,67 @@ def build_core_tools(butt: ButtplugController, screen: Optional[ScreenController
             )
         )
 
+        tools.register(
+            ToolSpec(
+                name="monitors",
+                description="List available monitors with indices for selecting which screen to view.",
+                parameters={"type": "object", "properties": {}, "additionalProperties": False},
+                fn=lambda: screen.monitors(),
+            )
+        )
+
+        tools.register(
+            ToolSpec(
+                name="screenshot_monitor_base64",
+                description="Capture a specific monitor by index and return a data:image/png;base64 URL.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "monitor_index": {"type": "integer", "minimum": 0},
+                        "max_dim": {"type": "integer", "minimum": 256, "maximum": 4096, "default": 1600},
+                    },
+                    "required": ["monitor_index"],
+                    "additionalProperties": False,
+                },
+                fn=lambda monitor_index, max_dim=1600: screen.screenshot_monitor_base64(
+                    monitor_index=int(monitor_index), max_dim=int(max_dim)
+                ),
+            )
+        )
+
+        tools.register(
+            ToolSpec(
+                name="screenshot_monitor",
+                description="Capture a specific monitor by index and return the saved PNG file path.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "monitor_index": {"type": "integer", "minimum": 0},
+                        "max_dim": {"type": "integer", "minimum": 256, "maximum": 4096, "default": 1600},
+                    },
+                    "required": ["monitor_index"],
+                    "additionalProperties": False,
+                },
+                fn=lambda monitor_index, max_dim=1600: screen.screenshot_monitor(
+                    monitor_index=int(monitor_index), max_dim=int(max_dim)
+                ),
+            )
+        )
+
+        tools.register(
+            ToolSpec(
+                name="screenshot_all_monitors_base64",
+                description="Capture all monitors and return JSON with a list of data:image/png;base64 URLs.",
+                parameters={
+                    "type": "object",
+                    "properties": {"max_dim": {"type": "integer", "minimum": 256, "maximum": 4096, "default": 1200}},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+                fn=lambda max_dim=1200: screen.screenshot_all_monitors_base64(max_dim=int(max_dim)),
+            )
+        )
+
     return tools
 
 
@@ -1284,6 +1483,7 @@ def main() -> int:
         "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
         "Be concise, careful, and confirm risky actions.\n"
         "When a tool is appropriate, call it.\n"
+        "For visual understanding of the desktop, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
     )
     if memory_text:
         base_system += "\nUser memory (treat as true unless contradicted):\n" + memory_text
@@ -1334,6 +1534,7 @@ def main() -> int:
                 "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
                 "Be concise, careful, and confirm risky actions.\n"
                 "When a tool is appropriate, call it.\n"
+                "For visual understanding of the desktop, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
             )
             if memory_text:
                 base_system2 += "\nUser memory (treat as true unless contradicted):\n" + memory_text
@@ -1507,6 +1708,20 @@ def main() -> int:
                         "content": result,
                     }
                 )
+
+                # If a tool returned a screenshot as a data URL, inject it into the next model call
+                # as a real `image_url` input (so the model can analyze it).
+                img_urls = extract_image_data_urls(result)
+                if img_urls:
+                    label = tool_name
+                    if tool_name == "screenshot_monitor_base64" and isinstance(args, dict):
+                        label = f"screenshot_monitor_base64 (monitor_index={args.get('monitor_index')})"
+                    elif tool_name == "screenshot_all_monitors_base64":
+                        label = "screenshot_all_monitors_base64"
+                    content_parts: List[Dict[str, Any]] = [{"type": "text", "text": f"{label} provided desktop images."}]
+                    for u in img_urls:
+                        content_parts.append({"type": "image_url", "image_url": {"url": u}})
+                    messages.append({"role": "user", "content": content_parts})
 
             try:
                 resp = xai.chat(messages, tools=tools.list_specs_for_model())
