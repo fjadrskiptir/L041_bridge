@@ -77,24 +77,22 @@ Tools (available to Grok via tool-calls):
 - **`click`**: click coordinates
 - **`type_text`**: type into focused field
 - **`hotkey`**: press key combos
-- **`screenshot`** / **`screenshot_base64`**: capture the screen
+- **`monitors`**: list monitors with indices (0..N-1)
+- **`screenshot_monitor_base64`**: screenshot one monitor and return a data URL
+- **`screenshot_all_monitors_base64`**: screenshot all monitors and return data URLs
+- **`screenshot`** / **`screenshot_base64`**: legacy single-screen screenshot helpers
 
 ### Feasibility: “see both screens”
 **Yes, feasible.** On macOS, screenshotting + multi-monitor capture is doable, but requires permissions:
 - **System Settings → Privacy & Security → Accessibility** (for control)
 - **System Settings → Privacy & Security → Screen Recording** (for screenshots)
 
-Recommended next tools to add:
-- `screenshot_all_monitors()`
-- `screenshot_monitor(index)`
-- `screen_size()` / `monitors()`
-
 To make Loki “respond in chat accordingly”, the common loop is:
 1) capture screenshot(s)
 2) send to Grok as image input
 3) Grok chooses actions (click/type/hotkey) based on what it sees
 
-This is already supported today through `/attach` (images) and via `screenshot_base64`.
+Vision analysis is done by Loki using xAI's **Responses API** (not the chat-completions tool loop), so screenshots can be understood reliably.
 
 ---
 
