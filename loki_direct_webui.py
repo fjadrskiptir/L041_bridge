@@ -156,7 +156,7 @@ class LokiWebUI:
             if self._busy:
                 return jsonify({"ok": False, "reason": "busy"}), 409
             try:
-                print("[webui] voice/start")
+                print("[webui] voice/start", flush=True)
                 self.voice_mgr.start_recording()
             except Exception as e:
                 return jsonify({"ok": False, "reason": str(e)}), 500
@@ -167,7 +167,7 @@ class LokiWebUI:
             if self.voice_mgr is None:
                 return jsonify({"ok": False, "reason": "no voice manager"}), 400
             try:
-                print("[webui] voice/stop")
+                print("[webui] voice/stop", flush=True)
                 self.voice_mgr.stop_recording()
             except Exception:
                 pass
@@ -622,7 +622,7 @@ class LokiWebUI:
 
 def main() -> None:
     ui = LokiWebUI()
-    print(f"[webui] Listening on {APP_HOST}:{APP_PORT}")
+    print(f"[webui] Listening on {APP_HOST}:{APP_PORT}", flush=True)
     ui.run()
 
 

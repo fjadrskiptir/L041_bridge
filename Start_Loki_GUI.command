@@ -59,6 +59,9 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 
+export LOKI_WEB_HOST="$HOST"
+export LOKI_WEB_PORT="$PORT"
+
 "$PYTHON_BIN" loki_direct_webui.py >"$LOG" 2>&1 &
 PID=$!
 echo "$PID" > "$PIDFILE"
