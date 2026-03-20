@@ -45,6 +45,8 @@ python3 loki_direct.py
 
 `loki_direct.py` will attempt to use the repo `venv` automatically when run with `python3`.
 
+- **Web UI (macOS)**: double-click `Start_Loki_GUI.command` to open a basic browser UI with buttons (including Hold-to-Talk).
+
 ---
 
 ## Using Loki (chat UI)

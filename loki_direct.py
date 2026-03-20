@@ -21,6 +21,7 @@ import json
 import os
 import queue
 import re
+import subprocess
 import signal
 import sys
 import tempfile
@@ -107,12 +108,24 @@ VECTOR_DB_PATH = Path(os.getenv("LOKI_VECTOR_DB_PATH", "loki_memory.sqlite3")).r
 COMPILED_MEMORY_PATH = Path(os.getenv("LOKI_COMPILED_MEMORY_PATH", str(MEMORY_DIR / "compiled_memory.md"))).resolve()
 INBOX_DIR = Path(os.getenv("LOKI_INBOX_DIR", str(MEMORY_DIR / "inbox"))).resolve()
 PROCESSED_DIR = Path(os.getenv("LOKI_PROCESSED_DIR", str(MEMORY_DIR / "processed"))).resolve()
+SCREEN_CONFIG_PATH = Path(os.getenv("LOKI_SCREEN_CONFIG_PATH", str(MEMORY_DIR / "screen_indices.json"))).resolve()
 
 REQUEST_TIMEOUT_S = float(os.getenv("LOKI_HTTP_TIMEOUT_S", "60"))
 RETRIEVAL_K = int(os.getenv("LOKI_RETRIEVAL_K", "6"))
 WATCH_MEMORY_FOLDER = os.getenv("LOKI_WATCH_MEMORY_FOLDER", "1").strip() not in {"0", "false", "False", "no", "NO"}
 WATCH_POLL_S = float(os.getenv("LOKI_WATCH_POLL_S", "2.0"))
 LOKI_MAX_SCREENSHOT_IMAGES = int(os.getenv("LOKI_MAX_SCREENSHOT_IMAGES", "4"))
+VOICE_ENABLE = os.getenv("LOKI_VOICE_ENABLE", "1").strip() not in {"0", "false", "False", "no", "NO"}
+VOICE_HOTKEY = os.getenv("LOKI_VOICE_HOTKEY", "ctrl_l").strip().lower() or "ctrl_l"
+VOICE_STT_MODEL = os.getenv("LOKI_VOICE_STT_MODEL", "base").strip() or "base"
+VOICE_DEVICE = os.getenv("LOKI_VOICE_DEVICE", "cpu").strip() or "cpu"
+VOICE_COMPUTE_TYPE = os.getenv("LOKI_VOICE_COMPUTE_TYPE", "int8").strip() or "int8"
+VOICE_SAMPLE_RATE = int(os.getenv("LOKI_VOICE_SAMPLE_RATE", "16000"))
+VOICE_CHANNELS = int(os.getenv("LOKI_VOICE_CHANNELS", "1"))
+VOICE_MAX_SECONDS = float(os.getenv("LOKI_VOICE_MAX_SECONDS", "20"))
+VOICE_MIN_SECONDS = float(os.getenv("LOKI_VOICE_MIN_SECONDS", "0.6"))
+VOICE_TTS_ENABLE = os.getenv("LOKI_VOICE_TTS_ENABLE", "1").strip() not in {"0", "false", "False", "no", "NO"}
+VOICE_SAY_VOICE = os.getenv("LOKI_SAY_VOICE", "").strip()
 LOKI_SCREENSHOT_ON_ERROR_BLANK = os.getenv("LOKI_SCREENSHOT_ON_ERROR_BLANK", "0").strip().lower() in {
     "1",
     "true",
@@ -251,6 +264,29 @@ def looks_like_existing_path(s: str) -> Optional[Path]:
     except Exception:
         return None
     return None
+
+
+def load_screen_indices() -> Dict[str, int]:
+    """
+    Persisted mapping for:
+      left: monitor index to treat as "left screen"
+      right: monitor index to treat as "right screen"
+    """
+    defaults = {"left": 0, "right": 1}
+    try:
+        if SCREEN_CONFIG_PATH.exists():
+            raw = json.loads(SCREEN_CONFIG_PATH.read_text(encoding="utf-8"))
+            left = int(raw.get("left", defaults["left"]))
+            right = int(raw.get("right", defaults["right"]))
+            return {"left": left, "right": right}
+    except Exception:
+        pass
+    return defaults
+
+
+def save_screen_indices(indices: Dict[str, int]) -> None:
+    SCREEN_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SCREEN_CONFIG_PATH.write_text(json.dumps(indices, indent=2), encoding="utf-8")
 
 
 def iter_supported_files(root: Path, *, exclude_inbox: bool = True) -> List[Path]:
@@ -626,6 +662,299 @@ class ScreenController:
         path = Path(tempfile.mkstemp(prefix="loki_", suffix=".png")[1]).resolve()
         pyautogui.screenshot(str(path))
         return str(path)
+
+
+# -----------------------------
+# Voice (hold-to-speak + TTS)
+# -----------------------------
+
+class VoiceManager:
+    def __init__(
+        self,
+        *,
+        hotkey_char: str,
+        stt_model: str,
+        device: str,
+        compute_type: str,
+        sample_rate: int,
+        channels: int,
+        max_seconds: float,
+        min_seconds: float,
+        tts_enable: bool,
+        say_voice: str,
+        stt_task_fn: Callable[[str], None],
+    ):
+        self.hotkey_spec = str(hotkey_char).strip().lower()
+        self.stt_model = stt_model
+        self.device = device
+        self.compute_type = compute_type
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self.max_seconds = float(max_seconds)
+        self.min_seconds = float(min_seconds)
+        self.tts_enable = tts_enable
+        self.say_voice = say_voice
+        self.stt_task_fn = stt_task_fn
+
+        self._listening = False
+        self._recording = False
+        self._stream = None
+        self._frames = []
+        self._frames_lock = threading.Lock()
+        self._stop_timer: Optional[threading.Timer] = None
+
+        self._stt_model_obj = None
+        self._stt_model_lock = threading.Lock()
+
+        self._tts_proc: Optional[subprocess.Popen] = None
+        self._tts_lock = threading.Lock()
+
+        self._kb_listener = None
+
+    def _tts_say(self, text: str) -> None:
+        if not self.tts_enable:
+            return
+        text = (text or "").strip()
+        if not text:
+            return
+        with self._tts_lock:
+            try:
+                if self._tts_proc and self._tts_proc.poll() is None:
+                    self._tts_proc.terminate()
+            except Exception:
+                pass
+
+            cmd = ["say"]
+            if self.say_voice:
+                cmd += ["-v", self.say_voice]
+            cmd += [text]
+            try:
+                self._tts_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                self._tts_proc = None
+
+    def speak(self, text: str) -> None:
+        # External hook used by our chat logic.
+        self._tts_say(text)
+
+    def _ensure_stt_model(self):
+        with self._stt_model_lock:
+            if self._stt_model_obj is not None:
+                return self._stt_model_obj
+            from faster_whisper import WhisperModel
+
+            self._stt_model_obj = WhisperModel(
+                self.stt_model,
+                device=self.device,
+                compute_type=self.compute_type,
+            )
+            return self._stt_model_obj
+
+    def _start_recording(self) -> None:
+        if self._recording:
+            return
+        # Stop any ongoing TTS so it doesn't talk over you.
+        with self._tts_lock:
+            try:
+                if self._tts_proc and self._tts_proc.poll() is None:
+                    self._tts_proc.terminate()
+            except Exception:
+                pass
+
+        import numpy as np
+        import sounddevice as sd
+
+        self._frames = []
+        self._recording = True
+        started_at = time.time()
+
+        def callback(indata, frames, time_info, status):
+            if status:
+                # Non-fatal audio warnings.
+                pass
+            # Keep raw PCM samples.
+            self._frames.append(np.copy(indata))
+
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            dtype="int16",
+            callback=callback,
+        )
+        self._stream.start()
+
+        def auto_stop():
+            # Ensure we stop even if user holds too long.
+            if not self._recording:
+                return
+            try:
+                self._stop_recording()
+            except Exception:
+                pass
+
+        self._stop_timer = threading.Timer(self.max_seconds, auto_stop)
+        self._stop_timer.daemon = True
+        self._stop_timer.start()
+
+    def _stop_recording(self) -> None:
+        if not self._recording:
+            return
+        self._recording = False
+        if self._stop_timer:
+            try:
+                self._stop_timer.cancel()
+            except Exception:
+                pass
+            self._stop_timer = None
+
+        try:
+            if self._stream:
+                self._stream.stop()
+                self._stream.close()
+        except Exception:
+            pass
+        self._stream = None
+
+        with self._frames_lock:
+            frames = self._frames
+        if not frames:
+            return
+
+        import numpy as np
+
+        audio = np.concatenate(frames, axis=0)
+        # audio shape: (num_samples, channels)
+        if audio.ndim == 1:
+            audio = audio.reshape(-1, 1)
+        num_samples = audio.shape[0]
+        dur_s = num_samples / float(self.sample_rate)
+        if dur_s < self.min_seconds:
+            print("[voice] Ignored too-short utterance.")
+            return
+
+        # Write a temporary WAV file (whisper/whisper-faster reads paths).
+        wav_path = Path(tempfile.mkstemp(prefix="loki_voice_", suffix=".wav")[1]).resolve()
+        import wave
+
+        try:
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(self.channels)
+                wf.setsampwidth(2)  # int16
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(audio.astype(np.int16).tobytes())
+        except Exception:
+            try:
+                wav_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            print("[voice] Failed to write WAV.")
+            return
+
+        # STT in background to avoid blocking keyboard listener.
+        threading.Thread(target=self._transcribe_and_dispatch, args=(wav_path,), daemon=True).start()
+
+    def _transcribe_and_dispatch(self, wav_path: Path) -> None:
+        try:
+            print("[voice] Transcribing...")
+            model = self._ensure_stt_model()
+            segments, info = model.transcribe(
+                str(wav_path),
+                language=None,
+                vad_filter=False,
+            )
+            text = " ".join([seg.text.strip() for seg in segments if getattr(seg, "text", None)])
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                print(f"[voice] Heard: {text}")
+                self.stt_task_fn(text)
+            else:
+                print("[voice] No speech detected.")
+        except Exception as e:
+            print(f"[voice] STT failed: {e}")
+        finally:
+            try:
+                wav_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    def start(self) -> None:
+        if self._listening:
+            return
+        self._listening = True
+
+        from pynput import keyboard
+        Key = keyboard.Key
+
+        def matches_hotkey(key_obj) -> bool:
+            # Character hotkey (single letter)
+            if hasattr(key_obj, "char") and key_obj.char:
+                return self.hotkey_spec == str(key_obj.char).lower()[:1]
+            # Special keys
+            if self.hotkey_spec in {"caps_lock", "capslock"}:
+                return key_obj == Key.caps_lock
+            if self.hotkey_spec in {"ctrl", "control", "ctrl_l"}:
+                return key_obj == Key.ctrl_l
+            if self.hotkey_spec in {"ctrl_r"}:
+                return key_obj == Key.ctrl_r
+            if self.hotkey_spec in {"shift", "shift_l"}:
+                return key_obj == Key.shift_l
+            if self.hotkey_spec in {"shift_r"}:
+                return key_obj == Key.shift_r
+            if self.hotkey_spec in {"alt", "alt_l"}:
+                return key_obj == Key.alt_l
+            if self.hotkey_spec in {"alt_r"}:
+                return key_obj == Key.alt_r
+            return False
+
+        def should_toggle_on_press() -> bool:
+            # Caps lock is not a true "hold-to-speak" key; treat it as toggle.
+            return self.hotkey_spec in {"caps_lock", "capslock"}
+
+        def on_press(key):
+            try:
+                if matches_hotkey(key):
+                    if should_toggle_on_press():
+                        # Toggle recording.
+                        if self._recording:
+                            self._stop_recording()
+                        else:
+                            self._start_recording()
+                    else:
+                        self._start_recording()
+            except Exception:
+                pass
+
+        def on_release(key):
+            try:
+                if matches_hotkey(key):
+                    if should_toggle_on_press():
+                        return
+                    self._stop_recording()
+            except Exception:
+                pass
+
+        self._kb_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self._kb_listener.daemon = True
+        self._kb_listener.start()
+
+    def stop(self) -> None:
+        self._listening = False
+        try:
+            if self._kb_listener:
+                self._kb_listener.stop()
+        except Exception:
+            pass
+        try:
+            self._stop_recording()
+        except Exception:
+            pass
+
+    # UI-friendly wrappers (no global hotkey required)
+    def start_recording(self) -> None:
+        self._start_recording()
+
+    def stop_recording(self) -> None:
+        self._stop_recording()
 
 
 # -----------------------------
@@ -1480,6 +1809,10 @@ def print_banner() -> None:
     print("  /ingest <path> (add file/folder into vector memory)")
     print("  /compile_mem (write compiled memory document)")
     print(f"  drop files into: {INBOX_DIR} (auto-moves to {PROCESSED_DIR})")
+    print("  /set_screen <left|right> <monitor_index> (persist which physical screen index is which)")
+    print("  /autodetect_screens (choose left/right based on monitor X positions)")
+    if VOICE_ENABLE:
+        print(f"  Voice: hold '{VOICE_HOTKEY}' to speak (TTS={'on' if VOICE_TTS_ENABLE else 'off'})")
     print("  /tools (list tool names)")
     print("  /scan (scan Intiface devices)")
     print("  /upgrade <request>   (e.g. /upgrade add tts)")
@@ -1502,6 +1835,10 @@ def main() -> int:
         screen = None
         print(f"[screen] Disabled: {e}")
 
+    screen_indices = load_screen_indices()
+    if screen is not None:
+        print(f"[screen] Using indices: left={screen_indices['left']} right={screen_indices['right']}")
+
     # Memory
     memory_text, memory_warnings = load_memories(MEMORY_DIR)
     if memory_warnings:
@@ -1517,6 +1854,43 @@ def main() -> int:
     ensure_plugins_package(PLUGINS_DIR)
     for msg in load_plugins(PLUGINS_DIR, tools):
         print(f"[plugin] {msg}")
+
+    if screen is not None:
+        # Screen helpers so you don't have to remember monitor indices.
+        tools.add_tool(
+            name="screen_left_index",
+            description="Return the configured monitor index Loki should treat as the LEFT screen.",
+            fn=lambda: int(screen_indices.get("left", 0)),
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        )
+        tools.add_tool(
+            name="screen_right_index",
+            description="Return the configured monitor index Loki should treat as the RIGHT screen.",
+            fn=lambda: int(screen_indices.get("right", 0)),
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        )
+        tools.add_tool(
+            name="screenshot_left_base64",
+            description="Screenshot the configured LEFT screen and return a data:image/png;base64 URL.",
+            fn=lambda max_dim=1600: screen.screenshot_monitor_base64(int(screen_indices.get("left", 0)), max_dim=int(max_dim)),
+            parameters={
+                "type": "object",
+                "properties": {"max_dim": {"type": "integer", "minimum": 256, "maximum": 4096, "default": 1600}},
+                "required": [],
+                "additionalProperties": False,
+            },
+        )
+        tools.add_tool(
+            name="screenshot_right_base64",
+            description="Screenshot the configured RIGHT screen and return a data:image/png;base64 URL.",
+            fn=lambda max_dim=1600: screen.screenshot_monitor_base64(int(screen_indices.get("right", 0)), max_dim=int(max_dim)),
+            parameters={
+                "type": "object",
+                "properties": {"max_dim": {"type": "integer", "minimum": 256, "maximum": 4096, "default": 1600}},
+                "required": [],
+                "additionalProperties": False,
+            },
+        )
 
     xai = XAIClient(XAI_API_KEY, XAI_ENDPOINT, XAI_MODEL, timeout_s=REQUEST_TIMEOUT_S)
     vstore = VectorMemoryStore(VECTOR_DB_PATH)
@@ -1536,6 +1910,153 @@ def main() -> int:
         base_system += "\nUser memory (treat as true unless contradicted):\n" + memory_text
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": base_system}]
+
+    chat_lock = threading.Lock()
+    voice_mgr: Optional[VoiceManager] = None
+
+    def _voice_stt_task(text: str) -> None:
+        nonlocal voice_mgr
+        with chat_lock:
+            user_in = (text or "").strip()
+            if not user_in:
+                return
+
+            # Retrieval: embed the user's text and attach top-k relevant chunks.
+            retrieved_block = ""
+            try:
+                qemb = embed_texts(xai, [user_in])[0]
+                hits = vstore.search(qemb, k=RETRIEVAL_K)
+                if hits:
+                    parts = []
+                    for h in hits:
+                        parts.append(
+                            f"- score={h['score']:.3f} source={h['source_path']} chunk={h['chunk_index']}\n{h['text']}"
+                        )
+                    retrieved_block = "Retrieved memory:\n" + "\n\n".join(parts)
+            except Exception:
+                retrieved_block = ""
+
+            # Append user message for this turn.
+            if retrieved_block:
+                messages.append({"role": "user", "content": f"{user_in}\n\n---\n{retrieved_block}"})
+            else:
+                messages.append({"role": "user", "content": user_in})
+
+            # Call xAI with tools enabled.
+            resp = xai.chat(messages, tools=tools.list_specs_for_model())
+            msg = extract_assistant_message(resp)
+
+            # Tool call loop (OpenAI-style)
+            while True:
+                tool_calls = msg.get("tool_calls") or []
+                function_call = msg.get("function_call")
+                if function_call and not tool_calls:
+                    tool_calls = [{"id": "legacy", "type": "function", "function": function_call}]
+
+                if not tool_calls:
+                    break
+
+                messages.append(msg)
+
+                for tc in tool_calls:
+                    fn = (tc.get("function") or {})
+                    tool_name = fn.get("name")
+                    raw_args = fn.get("arguments") or "{}"
+                    try:
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                    except Exception:
+                        args = {}
+                    result = run_tool_call(tools, str(tool_name), args if isinstance(args, dict) else {})
+
+                    if tool_name in {
+                        "screenshot_monitor_base64",
+                        "screenshot_all_monitors_base64",
+                        "screenshot_left_base64",
+                        "screenshot_right_base64",
+                    }:
+                        img_urls = extract_image_data_urls(result)
+                        if img_urls:
+                            if tool_name == "screenshot_monitor_base64" and isinstance(args, dict):
+                                mi = args.get("monitor_index")
+                                prompt = (
+                                    f"You are viewing a screenshot of desktop monitor index {mi}. "
+                                    "Describe all visible text and important UI elements. "
+                                    "Quote readable text as closely as possible."
+                                )
+                            elif tool_name == "screenshot_left_base64":
+                                prompt = (
+                                    "You are viewing the user's LEFT screen. "
+                                    "Describe all visible text and important UI elements. "
+                                    "Quote readable text as closely as possible."
+                                )
+                            elif tool_name == "screenshot_right_base64":
+                                prompt = (
+                                    "You are viewing the user's RIGHT screen. "
+                                    "Describe all visible text and important UI elements. "
+                                    "Quote readable text as closely as possible."
+                                )
+                            else:
+                                prompt = (
+                                    "You are viewing screenshots of multiple desktop monitors provided in order. "
+                                    "For each image in order, describe visible text and important UI elements. "
+                                    "Quote readable text as closely as possible."
+                                )
+                            result = analyze_images_with_xai_responses(
+                                xai.api_key,
+                                img_urls,
+                                prompt,
+                                max_output_tokens=360,
+                            )
+
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id") or "tool",
+                            "name": tool_name,
+                            "content": result,
+                        }
+                    )
+
+                resp = xai.chat(messages, tools=tools.list_specs_for_model())
+                msg = extract_assistant_message(resp)
+
+            content = msg.get("content") or ""
+            if isinstance(content, list):
+                content = "\n".join([p.get("text", "") for p in content if isinstance(p, dict)])
+
+            print(f"Loki> {content}")
+            messages.append({"role": "assistant", "content": content})
+
+            try:
+                if voice_mgr:
+                    voice_mgr.speak(str(content))
+            except Exception:
+                pass
+
+    if VOICE_ENABLE:
+        print("[voice] Hold-to-speak enabled.")
+        print(f"[voice] Hold-to-speak hotkey spec: '{VOICE_HOTKEY}'.")
+        print("[voice] Permissions you may need:")
+        print("- Microphone (for recording)")
+        print("- Input Monitoring + Accessibility (for global hotkey listening via pynput)")
+        try:
+            voice_mgr = VoiceManager(
+                hotkey_char=VOICE_HOTKEY,
+                stt_model=VOICE_STT_MODEL,
+                device=VOICE_DEVICE,
+                compute_type=VOICE_COMPUTE_TYPE,
+                sample_rate=VOICE_SAMPLE_RATE,
+                channels=VOICE_CHANNELS,
+                max_seconds=VOICE_MAX_SECONDS,
+                min_seconds=VOICE_MIN_SECONDS,
+                tts_enable=VOICE_TTS_ENABLE,
+                say_voice=VOICE_SAY_VOICE,
+                stt_task_fn=_voice_stt_task,
+            )
+            voice_mgr.start()
+        except Exception as e:
+            voice_mgr = None
+            print(f"[voice] Disabled (init failed): {e}")
 
     # Graceful exit
     stop_now = threading.Event()
@@ -1557,6 +2078,47 @@ def main() -> int:
             continue
         if user_in.lower() in {"/quit", "quit", "exit"}:
             break
+
+        if user_in.startswith("/set_screen "):
+            raw = user_in[len("/set_screen ") :].strip()
+            parts = raw.split()
+            if len(parts) != 2:
+                print("Usage: /set_screen <left|right> <monitor_index>")
+                continue
+            side = parts[0].strip().lower()
+            if side not in {"left", "right"}:
+                print("Side must be `left` or `right`.")
+                continue
+            try:
+                idx = int(parts[1])
+            except Exception:
+                print("monitor_index must be an integer.")
+                continue
+            screen_indices[side] = idx
+            save_screen_indices(screen_indices)
+            print(f"[screen] Updated indices: left={screen_indices['left']} right={screen_indices['right']}")
+            continue
+
+        if user_in == "/autodetect_screens":
+            if screen is None:
+                print("[screen] Disabled (no screen tools).")
+                continue
+            try:
+                mons = screen.monitors()
+                if not mons:
+                    print("[screen] No monitors detected.")
+                    continue
+                # Choose left/right based on monitor left coordinate.
+                mons_sorted = sorted(mons, key=lambda m: int(m.get("left", 0)))
+                left_m = mons_sorted[0]
+                right_m = mons_sorted[-1]
+                screen_indices["left"] = int(left_m["index"])
+                screen_indices["right"] = int(right_m["index"])
+                save_screen_indices(screen_indices)
+                print(f"[screen] Autodetected: left={screen_indices['left']} right={screen_indices['right']}")
+            except Exception as e:
+                print(f"[screen] Autodetect failed: {e}")
+            continue
 
         # If they paste a real file path, treat it like /attach automatically.
         autop = looks_like_existing_path(user_in)
@@ -1760,12 +2322,33 @@ def main() -> int:
                 except Exception:
                     args = {}
                 result = run_tool_call(tools, str(tool_name), args if isinstance(args, dict) else {})
-                if tool_name in {"screenshot_monitor_base64", "screenshot_all_monitors_base64"}:
+                if tool_name in {
+                    "screenshot_monitor_base64",
+                    "screenshot_all_monitors_base64",
+                    "screenshot_left_base64",
+                    "screenshot_right_base64",
+                }:
                     img_urls = extract_image_data_urls(result)
                     if img_urls:
                         if tool_name == "screenshot_monitor_base64" and isinstance(args, dict):
                             mi = args.get("monitor_index")
-                            prompt = f"You are viewing a screenshot of desktop monitor index {mi}. Describe all visible text and important UI elements. Quote readable text as closely as possible."
+                            prompt = (
+                                f"You are viewing a screenshot of desktop monitor index {mi}. "
+                                "Describe all visible text and important UI elements. "
+                                "Quote readable text as closely as possible."
+                            )
+                        elif tool_name == "screenshot_left_base64":
+                            prompt = (
+                                "You are viewing the user's LEFT screen. "
+                                "Describe all visible text and important UI elements. "
+                                "Quote readable text as closely as possible."
+                            )
+                        elif tool_name == "screenshot_right_base64":
+                            prompt = (
+                                "You are viewing the user's RIGHT screen. "
+                                "Describe all visible text and important UI elements. "
+                                "Quote readable text as closely as possible."
+                            )
                         else:
                             prompt = (
                                 "You are viewing screenshots of multiple desktop monitors provided in order. "
@@ -1810,6 +2393,11 @@ def main() -> int:
     try:
         if watcher:
             watcher.stop()
+    except Exception:
+        pass
+    try:
+        if voice_mgr:
+            voice_mgr.stop()
     except Exception:
         pass
     butt.stop()
