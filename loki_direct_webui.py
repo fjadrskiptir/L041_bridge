@@ -21,13 +21,16 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from flask import Flask, jsonify, request, send_from_directory
+import os
+
+from flask import Flask, jsonify, request
 
 import loki_direct as ld
 
 
-APP_PORT = int(Path("/dev/null") and __import__("os").environ.get("LOKI_WEB_PORT", "7865"))
-APP_HOST = __import__("os").environ.get("LOKI_WEB_HOST", "127.0.0.1")
+APP_PORT = int(os.environ.get("LOKI_WEB_PORT", "7865"))
+APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-20.voice-ui-v2")
 
 
 class LokiWebUI:
@@ -36,6 +39,7 @@ class LokiWebUI:
             raise RuntimeError("XAI_API_KEY not set in .env")
 
         self.app = Flask(__name__)
+        self.app.config["TEMPLATES_AUTO_RELOAD"] = True
         self.ui_events: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.chat_lock = threading.Lock()
         self._busy = False
@@ -83,6 +87,7 @@ class LokiWebUI:
         # Do NOT start hotkey listener; this UI drives start/stop recording.
 
         self._register_routes()
+        print(f"[webui] version={WEBUI_VERSION} starting at http://{APP_HOST}:{APP_PORT}", flush=True)
 
     def _build_system_prompt(self) -> str:
         base = (
@@ -101,7 +106,15 @@ class LokiWebUI:
     def _register_routes(self) -> None:
         @self.app.route("/")
         def index():
-            return self._html_page()
+            resp = self._html_page()
+            return resp
+
+        @self.app.after_request
+        def add_no_cache_headers(response):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            return response
 
         @self.app.route("/api/send", methods=["POST"])
         def api_send():
@@ -143,6 +156,7 @@ class LokiWebUI:
             if self._busy:
                 return jsonify({"ok": False, "reason": "busy"}), 409
             try:
+                print("[webui] voice/start")
                 self.voice_mgr.start_recording()
             except Exception as e:
                 return jsonify({"ok": False, "reason": str(e)}), 500
@@ -153,10 +167,23 @@ class LokiWebUI:
             if self.voice_mgr is None:
                 return jsonify({"ok": False, "reason": "no voice manager"}), 400
             try:
+                print("[webui] voice/stop")
                 self.voice_mgr.stop_recording()
             except Exception:
                 pass
             return jsonify({"ok": True})
+
+        @self.app.route("/api/voice/status", methods=["GET"])
+        def api_voice_status():
+            if self.voice_mgr is None:
+                return jsonify({"ok": True, "recording": False, "voiceEnabled": False})
+            return jsonify(
+                {
+                    "ok": True,
+                    "recording": bool(getattr(self.voice_mgr, "is_recording", lambda: False)()),
+                    "voiceEnabled": bool(self.voice_enabled),
+                }
+            )
 
         @self.app.route("/api/health", methods=["GET"])
         def api_health():
@@ -188,6 +215,7 @@ class LokiWebUI:
 </head>
 <body>
   <h2>Loki Direct</h2>
+  <div class="small">UI version: {WEBUI_VERSION}</div>
   <div id="log"></div>
 
   <div id="controls">
@@ -198,6 +226,7 @@ class LokiWebUI:
   <div id="voiceRow">
     <label><input id="voiceToggle" type="checkbox" checked/> Voice On</label>
     <button id="hold">Hold to Talk</button>
+    <button id="stop" disabled>Stop</button>
     <span class="small" id="status">Idle</span>
   </div>
 
@@ -208,6 +237,7 @@ class LokiWebUI:
   const sendBtn = document.getElementById('send');
   const voiceToggle = document.getElementById('voiceToggle');
   const holdBtn = document.getElementById('hold');
+  const stopBtn = document.getElementById('stop');
 
   function add(role, text) {{
     const div = document.createElement('div');
@@ -230,6 +260,24 @@ class LokiWebUI:
   }}
 
   setInterval(pollEvents, 500);
+  
+  async function syncVoiceUI() {{
+    try {{
+      const r = await fetch('/api/voice/status');
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d.recording) {{
+        holding = false;
+        holdBtn.disabled = !voiceToggle.checked;
+        stopBtn.disabled = !voiceToggle.checked;
+        status.textContent = 'Idle';
+      }}
+    }} catch (e) {{
+      // ignore
+    }}
+  }}
+  
+  setInterval(syncVoiceUI, 500);
 
   sendBtn.onclick = async () => {{
     const text = input.value.trim();
@@ -254,6 +302,7 @@ class LokiWebUI:
 
   voiceToggle.onchange = async () => {{
     holdBtn.disabled = !voiceToggle.checked;
+    stopBtn.disabled = !voiceToggle.checked;
     await fetch('/api/voice/toggle', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
@@ -263,28 +312,107 @@ class LokiWebUI:
 
   async function voiceStart() {{
     status.textContent = 'Listening...';
-    await fetch('/api/voice/start', {{method: 'POST'}});
+    const r = await fetch('/api/voice/start', {{method: 'POST'}});
+    if (!r.ok) {{
+      const txt = await r.text();
+      throw new Error('voice/start failed: ' + r.status + ' ' + txt);
+    }}
   }}
 
   async function voiceStop() {{
     status.textContent = 'Processing...';
-    await fetch('/api/voice/stop', {{method: 'POST'}});
-    // response will arrive through polling
-    setTimeout(() => status.textContent = 'Idle', 1000);
+    const r = await fetch('/api/voice/stop', {{method: 'POST'}});
+    // stop might fail if recording never started; still reset UI
+    try {{ if (r && r.ok) {{ setTimeout(() => status.textContent = 'Idle', 600); }} }} catch (e) {{}}
+    // Always reset promptly even if stop failed (prevents stuck button).
+    holdBtn.disabled = !voiceToggle.checked;
+    holding = false;
+    setTimeout(() => status.textContent = 'Idle', 300);
   }}
 
   let holding = false;
-  holdBtn.onmousedown = async (e) => {{
+  let safetyTimer = null;
+  const startHold = async () => {{
     if (!voiceToggle.checked) return;
+    if (holding) return;
     holding = true;
     holdBtn.disabled = true;
-    try {{ await voiceStart(); }} catch (err) {{ status.textContent = 'Voice error'; }}
+    stopBtn.disabled = false;
+    status.textContent = 'Listening...';
+    // Safety: if release event doesn't fire, stop after ~24s.
+    if (safetyTimer) clearTimeout(safetyTimer);
+    safetyTimer = setTimeout(() => {{
+      if (holding) {{
+        status.textContent = 'Auto-stopping...';
+        stopHold();
+      }}
+    }}, 24000);
+    try {{
+      await voiceStart();
+    }} catch (err) {{
+      holding = false;
+      holdBtn.disabled = !voiceToggle.checked;
+      status.textContent = 'Voice error';
+      if (safetyTimer) clearTimeout(safetyTimer);
+    }}
   }};
-  window.onmouseup = async () => {{
+
+  const stopHold = async () => {{
     if (!holding) return;
     holding = false;
+    if (safetyTimer) clearTimeout(safetyTimer);
     holdBtn.disabled = !voiceToggle.checked;
-    try {{ await voiceStop(); }} catch (err) {{ /* ignore */ }}
+    stopBtn.disabled = true;
+    try {{
+      await voiceStop();
+    }} catch (err) {{
+      // Always reset the UI if stop fails.
+      status.textContent = 'Idle';
+    }}
+  }};
+
+  // Pointer events are more reliable than mouse events (covers mouse + touch + trackpad).
+  holdBtn.addEventListener('pointerdown', async (e) => {{
+    e.preventDefault();
+    // Capture pointer so we get pointerup even if the cursor moves off.
+    try {{ holdBtn.setPointerCapture(e.pointerId); }} catch (err) {{}}
+    await startHold();
+  }});
+
+  // Listen directly on the button too (some browsers won't bubble document-level pointerup).
+  holdBtn.addEventListener('pointerup', async (e) => {{
+    e.preventDefault();
+    await stopHold();
+  }});
+  holdBtn.addEventListener('pointercancel', async (e) => {{
+    e.preventDefault();
+    await stopHold();
+  }});
+  holdBtn.addEventListener('mouseleave', async (_e) => {{
+    await stopHold();
+  }});
+
+  // Touch fallback
+  holdBtn.addEventListener('touchend', async (_e) => {{
+    await stopHold();
+  }});
+  holdBtn.addEventListener('touchcancel', async (_e) => {{
+    await stopHold();
+  }});
+
+  // Fallback: if release happens anywhere (or the tab loses focus), stop too.
+  document.addEventListener('pointerup', async (e) => {{
+    await stopHold();
+  }});
+  document.addEventListener('pointercancel', async (e) => {{
+    await stopHold();
+  }});
+  window.addEventListener('blur', async (e) => {{
+    await stopHold();
+  }});
+
+  stopBtn.onclick = async () => {{
+    await stopHold();
   }};
 </script>
 </body>
@@ -494,6 +622,7 @@ class LokiWebUI:
 
 def main() -> None:
     ui = LokiWebUI()
+    print(f"[webui] Listening on {APP_HOST}:{APP_PORT}")
     ui.run()
 
 

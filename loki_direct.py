@@ -766,6 +766,7 @@ class VoiceManager:
 
         self._frames = []
         self._recording = True
+        print("[voice] start_recording")
         started_at = time.time()
 
         def callback(indata, frames, time_info, status):
@@ -800,6 +801,7 @@ class VoiceManager:
         if not self._recording:
             return
         self._recording = False
+        print("[voice] stop_recording")
         if self._stop_timer:
             try:
                 self._stop_timer.cancel()
@@ -828,6 +830,7 @@ class VoiceManager:
             audio = audio.reshape(-1, 1)
         num_samples = audio.shape[0]
         dur_s = num_samples / float(self.sample_rate)
+        print(f"[voice] utterance_duration_s={dur_s:.2f} frames={num_samples}")
         if dur_s < self.min_seconds:
             print("[voice] Ignored too-short utterance.")
             return
@@ -955,6 +958,9 @@ class VoiceManager:
 
     def stop_recording(self) -> None:
         self._stop_recording()
+
+    def is_recording(self) -> bool:
+        return bool(self._recording)
 
 
 # -----------------------------
