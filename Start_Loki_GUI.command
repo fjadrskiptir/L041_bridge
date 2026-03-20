@@ -17,11 +17,23 @@ echo "[webui] Launching Loki Direct Web UI..."
 echo "[webui] URL: $URL"
 echo "[webui] Log: $LOG"
 
-# Stop any existing server listening on the configured port.
+# Choose a free port if the default is busy.
 PORT="$(echo "$URL" | sed -E 's#.*:([0-9]+)/.*#\1#')"
-if [ -z "$PORT" ]; then
-  PORT="7865"
-fi
+if [ -z "$PORT" ]; then PORT="7865"; fi
+HOST="$(echo "$URL" | sed -E 's#http://([^:/]+).*#\1#')"
+if [ -z "$HOST" ]; then HOST="127.0.0.1"; fi
+
+while true; do
+  if command -v lsof >/dev/null 2>&1; then
+    PIDS="$(lsof -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    if [ -z "$PIDS" ]; then
+      break
+    fi
+  fi
+  PORT="$((PORT+1))"
+done
+
+URL="http://$HOST:$PORT"
 if command -v lsof >/dev/null 2>&1; then
   EXISTING_PIDS="$(lsof -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
   if [ -n "$EXISTING_PIDS" ]; then
