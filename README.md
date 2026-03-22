@@ -185,6 +185,12 @@ Loki tries xAI embeddings, but will fall back to local hashing embeddings if you
 - **`LOKI_APPLE_CALENDAR`**: `1` (on) / `0` (off)
 - **`LOKI_APPLE_CALENDAR_DEFAULT`**: default calendar name when unspecified (default `Calendar`)
 
+### Voice / TTS
+- **`LOKI_VOICE_TTS_ENABLE`**: default spoken replies on/off (overridden by `memories/tts_settings.json` after UI save)
+- **`LOKI_SAY_VOICE`**: macOS `say -v` name (e.g. `Daniel`)
+- **`LOKI_SAY_RATE`**: `say -r` words per minute (empty = system default)
+- **`LOKI_TTS_SETTINGS_PATH`**: JSON file for saved UI voice settings (default `memories/tts_settings.json`)
+
 ---
 
 ## Self-upgrades (plugins)
@@ -207,12 +213,28 @@ Security note: plugin generation executes code you’re generating. Keep this lo
 ## Voice (feasibility + recommendations)
 
 ### TTS (Loki speaks)
-**Feasible and easy.** Good options:
-- **macOS built-in `say`** (zero deps, good “start now”)
-- **Piper** (local neural TTS, higher quality, offline)
-- Cloud TTS (highest quality, less “fully local”)
+**Default: macOS `say`** (zero extra deps). It’s fast but can sound “system robot” unless you tune it.
 
-Recommendation: start with **`say`** (quick plugin), then upgrade to **Piper** if you want high-quality offline voices.
+**Web UI (recommended)**  
+Open **“Voice & speech (how Loki sounds)”** on the chat page:
+- **Speak replies** — turn spoken answers on/off (independent of “Voice On” for the mic).
+- **Voice** — every voice macOS exposes via `say -v ?` (try **Daniel**, **Tom**, **Fred** for US English male; **Samantha** / **Karen** for female; **Premium** voices need **System Settings → Siri & Spotlight → Siri Voice** downloads).
+- **Speaking rate (WPM)** — slightly **slower** (e.g. 150–175) often sounds more natural than the default.
+- **Save** writes **`memories/tts_settings.json`** so CLI and web share the same profile.
+
+**`.env` (defaults before first save)**  
+- **`LOKI_SAY_VOICE`** — e.g. `Daniel` (empty = system default)  
+- **`LOKI_SAY_RATE`** — words per minute for `say -r` (empty = system default)  
+- **`LOKI_TTS_SETTINGS_PATH`** — override JSON path (default `memories/tts_settings.json`)
+
+**More natural speech (hardware / install)**  
+| Option | Quality | Notes |
+|--------|---------|--------|
+| **macOS `say` + Premium voice** | Good | Download enhanced voices in System Settings; pick them in the UI dropdown. |
+| **[Piper](https://github.com/rhasspy/piper)** | Very good | Local neural TTS; add a small bridge script + model; not wired in-repo yet. |
+| **Cloud APIs** (OpenAI TTS, ElevenLabs, etc.) | Best | Requires keys + network; can be added as a plugin or `LOKI_TTS_ENGINE` later. |
+
+Recommendation: tune **`say`** in the UI first; if you outgrow it, plan **Piper** for fully local neural speech.
 
 ### STT (you speak to Loki)
 **Feasible.** Options:
@@ -252,5 +274,5 @@ If xAI embeddings return 404/permission errors, Loki uses a **local embedding fa
 - **OCR**: reading text on-screen (e.g. chat apps). Options: `tesseract` or macOS Vision framework.
 - **Better local embeddings**: add a local embedding model later for higher-quality recall.
 - **Safety controls**: “confirm before click”, allowlist apps/regions.
-- **Voice**: start with `say`, add whisper.cpp for STT, then build a proper “voice mode”.
+- **Voice**: Web UI TTS tuning + optional Piper / cloud TTS backends.
 

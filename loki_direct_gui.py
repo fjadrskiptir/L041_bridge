@@ -132,6 +132,7 @@ class LokiGUI(tk.Tk):
             return
 
         # TTS uses macOS `say` inside VoiceManager.
+        _tts0 = ld.load_tts_settings_merged()
         self.voice_mgr = ld.VoiceManager(
             hotkey_char=ld.VOICE_HOTKEY,
             stt_model=ld.VOICE_STT_MODEL,
@@ -141,8 +142,9 @@ class LokiGUI(tk.Tk):
             channels=ld.VOICE_CHANNELS,
             max_seconds=ld.VOICE_MAX_SECONDS,
             min_seconds=ld.VOICE_MIN_SECONDS,
-            tts_enable=ld.VOICE_TTS_ENABLE,
-            say_voice=ld.VOICE_SAY_VOICE,
+            tts_enable=bool(_tts0["tts_enable"]),
+            say_voice=str(_tts0["say_voice"]),
+            say_rate_wpm=_tts0["say_rate_wpm"],
             stt_task_fn=lambda transcript: self._dispatch_voice_transcript(transcript),
         )
 
@@ -451,7 +453,7 @@ class LokiGUI(tk.Tk):
         self.messages.append({"role": "assistant", "content": content})
         self.after(0, lambda: self._render_chat("assistant", str(content)))
 
-        if self.voice_mgr:
+        if self.voice_mgr and self.voice_enabled and getattr(self.voice_mgr, "tts_enable", True):
             try:
                 self.voice_mgr.speak(str(content))
             except Exception:

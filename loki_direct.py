@@ -149,6 +149,26 @@ if _say_rate_raw:
     except ValueError:
         pass
 TTS_SETTINGS_PATH = Path(os.getenv("LOKI_TTS_SETTINGS_PATH", str(MEMORY_DIR / "tts_settings.json"))).resolve()
+
+# TTS engine: macOS `say` (default) or local **Piper** (neural). See README + `pip install piper-tts`.
+LOKI_TTS_ENGINE = os.getenv("LOKI_TTS_ENGINE", "say").strip().lower()
+if LOKI_TTS_ENGINE not in ("say", "piper"):
+    LOKI_TTS_ENGINE = "say"
+LOKI_PIPER_BINARY = (os.getenv("LOKI_PIPER_BINARY", "piper") or "piper").strip()
+_piper_model_env = os.getenv("LOKI_PIPER_MODEL", "").strip()
+LOKI_PIPER_MODEL: Optional[Path] = Path(_piper_model_env).expanduser().resolve() if _piper_model_env else None
+LOKI_PIPER_VOICE = (os.getenv("LOKI_PIPER_VOICE", "en_US-lessac-medium") or "en_US-lessac-medium").strip()
+_piper_dd = os.getenv("LOKI_PIPER_DATA_DIR", "").strip()
+LOKI_PIPER_DATA_DIR = Path(_piper_dd).expanduser().resolve() if _piper_dd else (MEMORY_DIR / "piper_voices").resolve()
+try:
+    LOKI_PIPER_LENGTH_SCALE = float(os.getenv("LOKI_PIPER_LENGTH_SCALE", "1.0"))
+except ValueError:
+    LOKI_PIPER_LENGTH_SCALE = 1.0
+_pspk = os.getenv("LOKI_PIPER_SPEAKER", "").strip()
+LOKI_PIPER_SPEAKER_ID: Optional[int] = int(_pspk) if _pspk.isdigit() else None
+_pmd = os.getenv("LOKI_PIPER_MODEL_DIR", "").strip()
+LOKI_PIPER_MODEL_DIR: Optional[Path] = Path(_pmd).expanduser().resolve() if _pmd else None
+
 LOKI_SCREENSHOT_ON_ERROR_BLANK = os.getenv("LOKI_SCREENSHOT_ON_ERROR_BLANK", "0").strip().lower() in {
     "1",
     "true",
@@ -692,6 +712,30 @@ class ScreenController:
 # -----------------------------
 
 
+def parse_piper_voice_setting(
+    stored: str,
+    *,
+    env_onnx: Optional[Path],
+    env_voice_default: str,
+) -> Tuple[Optional[Path], str]:
+    """
+    `stored` is either a path to a `.onnx` file (legacy Piper binary) or a Piper **voice id**
+    for `python -m piper -m <id>` (e.g. en_US-lessac-medium).
+    """
+
+    s = (stored or "").strip()
+    if s:
+        if s.lower().endswith(".onnx"):
+            p = Path(s).expanduser().resolve()
+            if p.is_file():
+                return p, ""
+            return None, ""
+        return None, s
+    if env_onnx is not None and env_onnx.is_file():
+        return env_onnx, ""
+    return None, (env_voice_default or "en_US-lessac-medium").strip()
+
+
 def list_macos_say_voices() -> List[Dict[str, str]]:
     """Parse `say -v ?` on macOS. Returns [{id, locale, sample}, ...]."""
 
@@ -769,10 +813,68 @@ def load_tts_settings_merged(path: Optional[Path] = None) -> Dict[str, Any]:
         tts_enable = te
     else:
         tts_enable = VOICE_TTS_ENABLE
+
+    eng = raw.get("tts_engine")
+    if isinstance(eng, str) and eng.strip().lower() in ("say", "piper"):
+        tts_engine = eng.strip().lower()
+    else:
+        tts_engine = LOKI_TTS_ENGINE
+
+    pv_raw = raw.get("piper_voice")
+    if isinstance(pv_raw, str) and pv_raw.strip():
+        piper_voice = pv_raw.strip()
+    else:
+        if LOKI_PIPER_MODEL is not None and LOKI_PIPER_MODEL.is_file():
+            piper_voice = str(LOKI_PIPER_MODEL)
+        else:
+            piper_voice = LOKI_PIPER_VOICE
+
+    pdd_raw = raw.get("piper_data_dir")
+    if isinstance(pdd_raw, str) and pdd_raw.strip():
+        piper_data_dir = Path(pdd_raw).expanduser().resolve()
+    else:
+        piper_data_dir = LOKI_PIPER_DATA_DIR
+
+    pbin_raw = raw.get("piper_binary")
+    if isinstance(pbin_raw, str) and pbin_raw.strip():
+        piper_binary = pbin_raw.strip()
+    else:
+        piper_binary = LOKI_PIPER_BINARY
+
+    pls = raw.get("piper_length_scale", LOKI_PIPER_LENGTH_SCALE)
+    try:
+        piper_length_scale = float(pls)
+    except (TypeError, ValueError):
+        piper_length_scale = LOKI_PIPER_LENGTH_SCALE
+
+    ps = raw.get("piper_speaker_id")
+    piper_speaker_id: Optional[int]
+    if ps is None or ps == "":
+        piper_speaker_id = LOKI_PIPER_SPEAKER_ID
+    else:
+        try:
+            piper_speaker_id = int(ps)
+        except (TypeError, ValueError):
+            piper_speaker_id = LOKI_PIPER_SPEAKER_ID
+
+    piper_onnx, piper_voice_module = parse_piper_voice_setting(
+        piper_voice,
+        env_onnx=LOKI_PIPER_MODEL,
+        env_voice_default=LOKI_PIPER_VOICE,
+    )
+
     return {
         "say_voice": str(voice).strip(),
         "say_rate_wpm": rate_out,
         "tts_enable": bool(tts_enable),
+        "tts_engine": tts_engine,
+        "piper_voice": piper_voice,
+        "piper_onnx": piper_onnx,
+        "piper_voice_module": piper_voice_module,
+        "piper_data_dir": piper_data_dir,
+        "piper_binary": piper_binary,
+        "piper_length_scale": piper_length_scale,
+        "piper_speaker_id": piper_speaker_id,
     }
 
 
@@ -841,29 +943,26 @@ class VoiceManager:
                 "tts_enable": self.tts_enable,
             }
 
-    def update_tts_settings(
-        self,
-        *,
-        say_voice: Optional[str] = None,
-        say_rate_wpm: Any = None,
-        tts_enable: Optional[bool] = None,
-    ) -> Dict[str, Any]:
-        """Update TTS parameters (thread-safe). Use say_rate_wpm=None or '' for system default."""
+    def apply_tts_request_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Apply only keys present in `data` (e.g. JSON body). `say_rate_wpm: null` clears to macOS default.
+        """
 
         with self._tts_settings_lock:
-            if say_voice is not None:
-                self.say_voice = str(say_voice).strip()
-            if say_rate_wpm is not None:
-                if say_rate_wpm in ("", None):
+            if "say_voice" in data:
+                self.say_voice = str(data.get("say_voice") or "").strip()
+            if "say_rate_wpm" in data:
+                v = data.get("say_rate_wpm")
+                if v in (None, ""):
                     self.say_rate_wpm = None
                 else:
                     try:
-                        r = int(say_rate_wpm)
+                        r = int(v)
                         self.say_rate_wpm = r if r > 0 else None
                     except (TypeError, ValueError):
                         pass
-            if tts_enable is not None:
-                self.tts_enable = bool(tts_enable)
+            if "tts_enable" in data:
+                self.tts_enable = bool(data.get("tts_enable"))
             return {
                 "say_voice": self.say_voice,
                 "say_rate_wpm": self.say_rate_wpm,
@@ -901,6 +1000,32 @@ class VoiceManager:
     def speak(self, text: str) -> None:
         # External hook used by our chat logic.
         self._tts_say(text)
+
+    def speak_preview(self, text: str) -> None:
+        """Play sample audio even when `tts_enable` is off (UI “test voice” button)."""
+
+        with self._tts_settings_lock:
+            voice = self.say_voice
+            rate = self.say_rate_wpm
+        text = (text or "").strip()
+        if not text:
+            return
+        with self._tts_lock:
+            try:
+                if self._tts_proc and self._tts_proc.poll() is None:
+                    self._tts_proc.terminate()
+            except Exception:
+                pass
+            cmd = ["say"]
+            if voice:
+                cmd += ["-v", voice]
+            if rate and int(rate) > 0:
+                cmd += ["-r", str(int(rate))]
+            cmd += [text]
+            try:
+                self._tts_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                self._tts_proc = None
 
     def _ensure_stt_model(self):
         with self._stt_model_lock:

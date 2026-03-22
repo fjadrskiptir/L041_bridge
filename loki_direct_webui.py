@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 import os
 import re
+import sys
 
 from flask import Flask, jsonify, request
 
@@ -220,16 +221,15 @@ class LokiWebUI:
             if self.voice_mgr is None:
                 return jsonify({"ok": False, "error": "no voice manager"}), 400
             data = request.get_json(force=True) or {}
-            snap = self.voice_mgr.update_tts_settings(
-                say_voice=data.get("say_voice"),
-                say_rate_wpm=data.get("say_rate_wpm"),
-                tts_enable=data.get("tts_enable"),
-            )
+            if not any(k in data for k in ("say_voice", "say_rate_wpm", "tts_enable")):
+                snap = self.voice_mgr.tts_settings_snapshot()
+                return jsonify({"ok": True, **snap, "settings_path": str(ld.TTS_SETTINGS_PATH)})
+            snap = self.voice_mgr.apply_tts_request_fields(data)
             try:
                 ld.save_tts_settings_file(snap)
             except Exception as e:
                 return jsonify({"ok": False, "error": f"save failed: {e}", "applied": snap}), 500
-            return jsonify({"ok": True, **snap})
+            return jsonify({"ok": True, **snap, "settings_path": str(ld.TTS_SETTINGS_PATH)})
 
         @self.app.route("/api/tts/test", methods=["POST"])
         def api_tts_test():
@@ -238,7 +238,7 @@ class LokiWebUI:
             data = request.get_json(force=True) or {}
             phrase = (data.get("text") or "Hello — I'm Loki. This is how I sound with your current voice settings.").strip()
             try:
-                self.voice_mgr.speak(phrase)
+                self.voice_mgr.speak_preview(phrase)
             except Exception as e:
                 return jsonify({"ok": False, "error": str(e)}), 500
             return jsonify({"ok": True})
@@ -265,6 +265,13 @@ class LokiWebUI:
     #hold {{ background: #f7f7f7; }}
     label {{ display: flex; align-items: center; gap: 8px; }}
     .small {{ color: #666; font-size: 12px; }}
+    #ttsPanel {{ margin-top: 14px; border: 1px solid #e0e0e0; border-radius: 10px; padding: 10px 12px; background: #fff; }}
+    #ttsPanel summary {{ cursor: pointer; font-weight: 600; }}
+    .tts-row {{ margin: 10px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }}
+    .tts-row label {{ flex: 1; min-width: 200px; }}
+    #ttsVoice {{ flex: 2; min-width: 220px; padding: 8px; border-radius: 8px; border: 1px solid #ddd; }}
+    #ttsRate {{ flex: 1; min-width: 160px; }}
+    .tts-actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
   </style>
 </head>
 <body>
@@ -283,6 +290,35 @@ class LokiWebUI:
     <button id="stop" disabled>Stop</button>
     <span class="small" id="status">Idle</span>
   </div>
+
+  <details id="ttsPanel">
+    <summary>Voice &amp; speech (how Loki sounds)</summary>
+    <p class="small" style="margin:8px 0 0 0">Uses macOS <code>say</code>. Pick a voice and speed; settings save to <code>memories/tts_settings.json</code>.</p>
+    <div class="tts-row">
+      <label><input type="checkbox" id="ttsSpeakReplies" checked/> Speak replies (audio when Loki answers)</label>
+    </div>
+    <div class="tts-row">
+      <label style="flex:2">Voice<br/>
+        <select id="ttsVoice"><option value="">System default</option></select>
+      </label>
+    </div>
+    <div class="tts-row">
+      <label style="flex:2">
+        <input type="checkbox" id="ttsRateDefault"/> Use Mac default speed (leave unchecked to set WPM)
+      </label>
+    </div>
+    <div class="tts-row">
+      <label style="flex:2">Speaking rate (words per minute)<br/>
+        <input type="range" id="ttsRate" min="100" max="260" step="5" value="175"/>
+        <span class="small" id="ttsRateVal">175</span>
+      </label>
+    </div>
+    <div class="tts-actions">
+      <button type="button" id="ttsSave">Save voice settings</button>
+      <button type="button" id="ttsTest">Test voice</button>
+    </div>
+    <p class="small" id="ttsHint"></p>
+  </details>
 
 <script>
   const log = document.getElementById('log');
@@ -483,6 +519,99 @@ class LokiWebUI:
   stopBtn.onclick = async () => {{
     await stopHold();
   }};
+
+  // --- TTS / voice appearance (macOS say) ---
+  const ttsSpeakReplies = document.getElementById('ttsSpeakReplies');
+  const ttsVoice = document.getElementById('ttsVoice');
+  const ttsRate = document.getElementById('ttsRate');
+  const ttsRateVal = document.getElementById('ttsRateVal');
+  const ttsRateDefault = document.getElementById('ttsRateDefault');
+  const ttsSave = document.getElementById('ttsSave');
+  const ttsTest = document.getElementById('ttsTest');
+  const ttsHint = document.getElementById('ttsHint');
+
+  function syncTtsRateDisabled() {{
+    ttsRate.disabled = ttsRateDefault.checked;
+    ttsRateVal.textContent = ttsRateDefault.checked ? 'default' : String(ttsRate.value);
+  }}
+  ttsRate.addEventListener('input', () => {{ if (!ttsRateDefault.checked) ttsRateVal.textContent = ttsRate.value; }});
+  ttsRateDefault.addEventListener('change', syncTtsRateDisabled);
+
+  async function loadTtsUi() {{
+    try {{
+      const vr = await fetch('/api/tts/voices');
+      const vd = await vr.json();
+      if (vd.platform && vd.platform !== 'darwin') {{
+        ttsHint.textContent = 'Voice list is only available on macOS. On other OSes, install Piper or another engine (see README).';
+        ttsVoice.disabled = true;
+        ttsSave.disabled = true;
+        ttsTest.disabled = true;
+        return;
+      }}
+      if (vd.voices && vd.voices.length) {{
+        while (ttsVoice.options.length > 1) ttsVoice.remove(1);
+        for (const v of vd.voices) {{
+          const opt = document.createElement('option');
+          opt.value = v.id;
+          const loc = v.locale ? ' (' + v.locale + ')' : '';
+          opt.textContent = v.id + loc;
+          ttsVoice.appendChild(opt);
+        }}
+      }}
+    }} catch (e) {{
+      ttsHint.textContent = 'Could not load voice list.';
+    }}
+    try {{
+      const sr = await fetch('/api/tts/settings');
+      const sd = await sr.json();
+      if (!sr.ok) return;
+      ttsSpeakReplies.checked = !!sd.tts_enable;
+      ttsVoice.value = sd.say_voice || '';
+      if (sd.say_rate_wpm == null || sd.say_rate_wpm === '') {{
+        ttsRateDefault.checked = true;
+      }} else {{
+        ttsRateDefault.checked = false;
+        const r = parseInt(sd.say_rate_wpm, 10);
+        if (!isNaN(r)) ttsRate.value = String(Math.min(260, Math.max(100, r)));
+      }}
+      syncTtsRateDisabled();
+      if (sd.settings_path) ttsHint.textContent = 'Settings file: ' + sd.settings_path;
+    }} catch (e) {{}}
+  }}
+
+  async function postTtsSettings() {{
+    const body = {{
+      say_voice: ttsVoice.value || '',
+      say_rate_wpm: ttsRateDefault.checked ? null : parseInt(ttsRate.value, 10),
+      tts_enable: ttsSpeakReplies.checked
+    }};
+    const r = await fetch('/api/tts/settings', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(body)
+    }});
+    const d = await r.json().catch(() => ({{}}));
+    if (!r.ok) {{
+      ttsHint.textContent = (d && d.error) ? d.error : 'Save failed';
+      return false;
+    }}
+    ttsHint.textContent = 'Saved. ' + (d.settings_path || '');
+    return true;
+  }}
+
+  ttsSave.onclick = async () => {{ await postTtsSettings(); }};
+  ttsSpeakReplies.addEventListener('change', async () => {{ await postTtsSettings(); }});
+
+  ttsTest.onclick = async () => {{
+    await postTtsSettings();
+    await fetch('/api/tts/test', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{}})
+    }});
+  }};
+
+  loadTtsUi();
 </script>
 </body>
 </html>"""
