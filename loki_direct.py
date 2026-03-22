@@ -899,6 +899,14 @@ class VoiceManager:
         tts_enable: bool,
         say_voice: str,
         say_rate_wpm: Optional[int] = None,
+        tts_engine: str = "say",
+        piper_voice: str = "",
+        piper_onnx: Optional[Path] = None,
+        piper_voice_module: str = "",
+        piper_data_dir: Optional[Path] = None,
+        piper_binary: str = "piper",
+        piper_length_scale: float = 1.0,
+        piper_speaker_id: Optional[int] = None,
         stt_task_fn: Callable[[str], None],
     ):
         self.hotkey_spec = str(hotkey_char).strip().lower()
@@ -917,6 +925,18 @@ class VoiceManager:
             _sr = 0
         self.say_rate_wpm: Optional[int] = _sr if _sr > 0 else None
         self.stt_task_fn = stt_task_fn
+
+        self.tts_engine = tts_engine if tts_engine in ("say", "piper") else "say"
+        self.piper_voice = (piper_voice or "").strip()
+        self.piper_onnx = piper_onnx
+        self.piper_voice_module = (piper_voice_module or "").strip()
+        self.piper_data_dir = piper_data_dir
+        self.piper_binary = (piper_binary or "piper").strip()
+        try:
+            self.piper_length_scale = float(piper_length_scale)
+        except (TypeError, ValueError):
+            self.piper_length_scale = 1.0
+        self.piper_speaker_id = piper_speaker_id
 
         self._tts_settings_lock = threading.Lock()
 
@@ -941,6 +961,12 @@ class VoiceManager:
                 "say_voice": self.say_voice,
                 "say_rate_wpm": self.say_rate_wpm,
                 "tts_enable": self.tts_enable,
+                "tts_engine": self.tts_engine,
+                "piper_voice": self.piper_voice,
+                "piper_data_dir": str(self.piper_data_dir) if self.piper_data_dir else "",
+                "piper_binary": self.piper_binary,
+                "piper_length_scale": self.piper_length_scale,
+                "piper_speaker_id": self.piper_speaker_id,
             }
 
     def apply_tts_request_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -963,29 +989,58 @@ class VoiceManager:
                         pass
             if "tts_enable" in data:
                 self.tts_enable = bool(data.get("tts_enable"))
+            if "tts_engine" in data:
+                te = str(data.get("tts_engine") or "").strip().lower()
+                if te in ("say", "piper"):
+                    self.tts_engine = te
+            if "piper_voice" in data:
+                self.piper_voice = str(data.get("piper_voice") or "").strip()
+                self.piper_onnx, self.piper_voice_module = parse_piper_voice_setting(
+                    self.piper_voice,
+                    env_onnx=LOKI_PIPER_MODEL,
+                    env_voice_default=LOKI_PIPER_VOICE,
+                )
+            if "piper_data_dir" in data:
+                pdd = str(data.get("piper_data_dir") or "").strip()
+                self.piper_data_dir = Path(pdd).expanduser().resolve() if pdd else LOKI_PIPER_DATA_DIR
+            if "piper_binary" in data:
+                self.piper_binary = str(data.get("piper_binary") or "piper").strip() or "piper"
+            if "piper_length_scale" in data:
+                try:
+                    self.piper_length_scale = float(data.get("piper_length_scale"))
+                except (TypeError, ValueError):
+                    pass
+            if "piper_speaker_id" in data:
+                ps = data.get("piper_speaker_id")
+                if ps in (None, ""):
+                    self.piper_speaker_id = None
+                else:
+                    try:
+                        self.piper_speaker_id = int(ps)
+                    except (TypeError, ValueError):
+                        pass
             return {
                 "say_voice": self.say_voice,
                 "say_rate_wpm": self.say_rate_wpm,
                 "tts_enable": self.tts_enable,
+                "tts_engine": self.tts_engine,
+                "piper_voice": self.piper_voice,
+                "piper_data_dir": str(self.piper_data_dir) if self.piper_data_dir else "",
+                "piper_binary": self.piper_binary,
+                "piper_length_scale": self.piper_length_scale,
+                "piper_speaker_id": self.piper_speaker_id,
             }
 
-    def _tts_say(self, text: str) -> None:
-        with self._tts_settings_lock:
-            tts_on = self.tts_enable
-            voice = self.say_voice
-            rate = self.say_rate_wpm
-        if not tts_on:
-            return
-        text = (text or "").strip()
-        if not text:
-            return
-        with self._tts_lock:
-            try:
-                if self._tts_proc and self._tts_proc.poll() is None:
-                    self._tts_proc.terminate()
-            except Exception:
-                pass
+    def _stop_tts_proc(self) -> None:
+        try:
+            if self._tts_proc and self._tts_proc.poll() is None:
+                self._tts_proc.terminate()
+        except Exception:
+            pass
 
+    def _play_say_popen(self, text: str, *, voice: str, rate: Optional[int]) -> None:
+        with self._tts_lock:
+            self._stop_tts_proc()
             cmd = ["say"]
             if voice:
                 cmd += ["-v", voice]
@@ -996,6 +1051,9 @@ class VoiceManager:
                 self._tts_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 self._tts_proc = None
+
+    def _tts_say(self, text: str) -> None:
+        self._dispatch_tts(text, preview=False)
 
     def speak(self, text: str) -> None:
         # External hook used by our chat logic.
@@ -1004,28 +1062,66 @@ class VoiceManager:
     def speak_preview(self, text: str) -> None:
         """Play sample audio even when `tts_enable` is off (UI “test voice” button)."""
 
-        with self._tts_settings_lock:
-            voice = self.say_voice
-            rate = self.say_rate_wpm
+        self._dispatch_tts(text, preview=True)
+
+    def _dispatch_tts(self, text: str, *, preview: bool) -> None:
+        if not preview and not self.tts_enable:
+            return
         text = (text or "").strip()
         if not text:
             return
-        with self._tts_lock:
+
+        with self._tts_settings_lock:
+            engine = self.tts_engine
+            voice = self.say_voice
+            rate = self.say_rate_wpm
+            onnx = self.piper_onnx
+            pvm = self.piper_voice_module
+            pdd = self.piper_data_dir
+            pbin = self.piper_binary
+            plen = self.piper_length_scale
+            pspk = self.piper_speaker_id
+
+        if engine != "piper":
+            self._play_say_popen(text, voice=voice, rate=rate)
+            return
+
+        def worker() -> None:
+            import loki_piper_tts as lpt
+
+            wav = lpt.synthesize_piper_wav(
+                text,
+                onnx_path=onnx,
+                voice_module=pvm,
+                data_dir=pdd,
+                piper_binary=pbin,
+                length_scale=plen if onnx is not None else None,
+                speaker_id=pspk,
+            )
+            if not wav:
+                print("[tts] Piper synthesis failed; falling back to macOS say", flush=True)
+                self._play_say_popen(text, voice=voice, rate=rate)
+                return
+            proc_local: Optional[subprocess.Popen] = None
             try:
-                if self._tts_proc and self._tts_proc.poll() is None:
-                    self._tts_proc.terminate()
-            except Exception:
-                pass
-            cmd = ["say"]
-            if voice:
-                cmd += ["-v", voice]
-            if rate and int(rate) > 0:
-                cmd += ["-r", str(int(rate))]
-            cmd += [text]
-            try:
-                self._tts_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                self._tts_proc = None
+                with self._tts_lock:
+                    self._stop_tts_proc()
+                    try:
+                        proc_local = lpt.play_wav_async(wav)
+                        self._tts_proc = proc_local
+                    except Exception as e:
+                        print(f"[tts] Piper play failed ({e}); falling back to say", flush=True)
+                if proc_local is None:
+                    self._play_say_popen(text, voice=voice, rate=rate)
+                else:
+                    proc_local.wait()
+            finally:
+                try:
+                    wav.unlink(missing_ok=True)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _ensure_stt_model(self):
         with self._stt_model_lock:
@@ -2621,6 +2717,14 @@ def main() -> int:
                 tts_enable=bool(_tts0["tts_enable"]),
                 say_voice=str(_tts0["say_voice"]),
                 say_rate_wpm=_tts0["say_rate_wpm"],
+                tts_engine=str(_tts0["tts_engine"]),
+                piper_voice=str(_tts0["piper_voice"]),
+                piper_onnx=_tts0["piper_onnx"],
+                piper_voice_module=str(_tts0["piper_voice_module"]),
+                piper_data_dir=_tts0["piper_data_dir"],
+                piper_binary=str(_tts0["piper_binary"]),
+                piper_length_scale=float(_tts0["piper_length_scale"]),
+                piper_speaker_id=_tts0["piper_speaker_id"],
                 stt_task_fn=_voice_stt_task,
             )
             voice_mgr.start()

@@ -35,7 +35,7 @@ _port_raw = str(_port_raw).strip()
 _port_match = re.search(r"([0-9]+)", _port_raw)
 APP_PORT = int(_port_match.group(1)) if _port_match else 7865
 APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
-WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-21.tts-voice-panel")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-22.tts-piper")
 
 
 class LokiWebUI:
@@ -78,6 +78,10 @@ class LokiWebUI:
 
         self.voice_enabled = True
         _tts0 = ld.load_tts_settings_merged()
+        try:
+            ld.LOKI_PIPER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         self.voice_mgr: Optional[ld.VoiceManager] = ld.VoiceManager(
             hotkey_char=ld.VOICE_HOTKEY,
             stt_model=ld.VOICE_STT_MODEL,
@@ -90,6 +94,14 @@ class LokiWebUI:
             tts_enable=bool(_tts0["tts_enable"]),
             say_voice=str(_tts0["say_voice"]),
             say_rate_wpm=_tts0["say_rate_wpm"],
+            tts_engine=str(_tts0["tts_engine"]),
+            piper_voice=str(_tts0["piper_voice"]),
+            piper_onnx=_tts0["piper_onnx"],
+            piper_voice_module=str(_tts0["piper_voice_module"]),
+            piper_data_dir=_tts0["piper_data_dir"],
+            piper_binary=str(_tts0["piper_binary"]),
+            piper_length_scale=float(_tts0["piper_length_scale"]),
+            piper_speaker_id=_tts0["piper_speaker_id"],
             stt_task_fn=self._on_voice_transcript,
         )
         # Do NOT start hotkey listener; this UI drives start/stop recording.
@@ -209,6 +221,19 @@ class LokiWebUI:
             voices = ld.list_macos_say_voices()
             return jsonify({"ok": True, "voices": voices, "platform": sys.platform})
 
+        @self.app.route("/api/tts/piper_onnx_models", methods=["GET"])
+        def api_tts_piper_onnx_models():
+            import loki_piper_tts as lpt
+
+            d = (request.args.get("dir") or "").strip()
+            if d:
+                root = Path(d).expanduser().resolve()
+            elif ld.LOKI_PIPER_MODEL_DIR is not None:
+                root = ld.LOKI_PIPER_MODEL_DIR
+            else:
+                root = ld.MEMORY_DIR
+            return jsonify({"ok": True, "directory": str(root), "models": lpt.list_onnx_in_dir(root)})
+
         @self.app.route("/api/tts/settings", methods=["GET"])
         def api_tts_settings_get():
             if self.voice_mgr is None:
@@ -221,7 +246,18 @@ class LokiWebUI:
             if self.voice_mgr is None:
                 return jsonify({"ok": False, "error": "no voice manager"}), 400
             data = request.get_json(force=True) or {}
-            if not any(k in data for k in ("say_voice", "say_rate_wpm", "tts_enable")):
+            _tts_keys = (
+                "say_voice",
+                "say_rate_wpm",
+                "tts_enable",
+                "tts_engine",
+                "piper_voice",
+                "piper_data_dir",
+                "piper_binary",
+                "piper_length_scale",
+                "piper_speaker_id",
+            )
+            if not any(k in data for k in _tts_keys):
                 snap = self.voice_mgr.tts_settings_snapshot()
                 return jsonify({"ok": True, **snap, "settings_path": str(ld.TTS_SETTINGS_PATH)})
             snap = self.voice_mgr.apply_tts_request_fields(data)
@@ -293,25 +329,61 @@ class LokiWebUI:
 
   <details id="ttsPanel">
     <summary>Voice &amp; speech (how Loki sounds)</summary>
-    <p class="small" style="margin:8px 0 0 0">Uses macOS <code>say</code>. Pick a voice and speed; settings save to <code>memories/tts_settings.json</code>.</p>
+    <p class="small" style="margin:8px 0 0 0">Choose <b>macOS say</b> or local neural <b>Piper</b> (<code>pip install piper-tts</code>). Settings save to <code>memories/tts_settings.json</code>.</p>
     <div class="tts-row">
       <label><input type="checkbox" id="ttsSpeakReplies" checked/> Speak replies (audio when Loki answers)</label>
     </div>
     <div class="tts-row">
-      <label style="flex:2">Voice<br/>
-        <select id="ttsVoice"><option value="">System default</option></select>
+      <label style="flex:2">TTS engine<br/>
+        <select id="ttsEngine">
+          <option value="say">macOS say</option>
+          <option value="piper">Piper (neural)</option>
+        </select>
       </label>
     </div>
-    <div class="tts-row">
-      <label style="flex:2">
-        <input type="checkbox" id="ttsRateDefault"/> Use Mac default speed (leave unchecked to set WPM)
-      </label>
+    <div id="sayBlock">
+      <div class="tts-row">
+        <label style="flex:2">macOS voice<br/>
+          <select id="ttsVoice"><option value="">System default</option></select>
+        </label>
+      </div>
+      <div class="tts-row">
+        <label style="flex:2">
+          <input type="checkbox" id="ttsRateDefault"/> Use Mac default speed (leave unchecked to set WPM)
+        </label>
+      </div>
+      <div class="tts-row">
+        <label style="flex:2">Speaking rate (words per minute)<br/>
+          <input type="range" id="ttsRate" min="100" max="260" step="5" value="175"/>
+          <span class="small" id="ttsRateVal">175</span>
+        </label>
+      </div>
     </div>
-    <div class="tts-row">
-      <label style="flex:2">Speaking rate (words per minute)<br/>
-        <input type="range" id="ttsRate" min="100" max="260" step="5" value="175"/>
-        <span class="small" id="ttsRateVal">175</span>
-      </label>
+    <div id="piperBlock" style="display:none">
+      <div class="tts-row">
+        <label style="flex:2">Piper voice <span class="small">(voice id or path to .onnx)</span><br/>
+          <input type="text" id="ttsPiperVoice" style="width:100%;padding:8px;border-radius:8px;border:1px solid #ddd" placeholder="en_US-lessac-medium"/>
+        </label>
+      </div>
+      <div class="tts-row">
+        <label style="flex:2">Piper data dir <span class="small">(downloaded voices)</span><br/>
+          <input type="text" id="ttsPiperDataDir" style="width:100%;padding:8px;border-radius:8px;border:1px solid #ddd" placeholder="memories/piper_voices"/>
+        </label>
+      </div>
+      <div class="tts-row">
+        <label style="flex:2">Legacy Piper binary <span class="small">(only if using .onnx file)</span><br/>
+          <input type="text" id="ttsPiperBinary" style="width:100%;padding:8px;border-radius:8px;border:1px solid #ddd" placeholder="piper"/>
+        </label>
+      </div>
+      <div class="tts-row">
+        <label>Length scale (.onnx only)<br/>
+          <input type="number" id="ttsPiperLength" step="0.05" min="0.5" max="2" value="1" style="width:100px;padding:8px"/>
+        </label>
+        <label>Speaker id <span class="small">(optional)</span><br/>
+          <input type="number" id="ttsPiperSpeaker" step="1" style="width:100px;padding:8px" placeholder=""/>
+        </label>
+      </div>
+      <p class="small">After <code>./venv/bin/python -m piper.download_voices en_US-lessac-medium</code>, use that voice id above and set data dir to where files were saved (often <code>memories/piper_voices</code>).</p>
     </div>
     <div class="tts-actions">
       <button type="button" id="ttsSave">Save voice settings</button>
@@ -520,15 +592,29 @@ class LokiWebUI:
     await stopHold();
   }};
 
-  // --- TTS / voice appearance (macOS say) ---
+  // --- TTS (say + Piper) ---
   const ttsSpeakReplies = document.getElementById('ttsSpeakReplies');
+  const ttsEngine = document.getElementById('ttsEngine');
+  const sayBlock = document.getElementById('sayBlock');
+  const piperBlock = document.getElementById('piperBlock');
   const ttsVoice = document.getElementById('ttsVoice');
   const ttsRate = document.getElementById('ttsRate');
   const ttsRateVal = document.getElementById('ttsRateVal');
   const ttsRateDefault = document.getElementById('ttsRateDefault');
+  const ttsPiperVoice = document.getElementById('ttsPiperVoice');
+  const ttsPiperDataDir = document.getElementById('ttsPiperDataDir');
+  const ttsPiperBinary = document.getElementById('ttsPiperBinary');
+  const ttsPiperLength = document.getElementById('ttsPiperLength');
+  const ttsPiperSpeaker = document.getElementById('ttsPiperSpeaker');
   const ttsSave = document.getElementById('ttsSave');
   const ttsTest = document.getElementById('ttsTest');
   const ttsHint = document.getElementById('ttsHint');
+
+  function refreshTtsEngineUi() {{
+    const p = ttsEngine.value === 'piper';
+    sayBlock.style.display = p ? 'none' : 'block';
+    piperBlock.style.display = p ? 'block' : 'none';
+  }}
 
   function syncTtsRateDisabled() {{
     ttsRate.disabled = ttsRateDefault.checked;
@@ -542,11 +628,8 @@ class LokiWebUI:
       const vr = await fetch('/api/tts/voices');
       const vd = await vr.json();
       if (vd.platform && vd.platform !== 'darwin') {{
-        ttsHint.textContent = 'Voice list is only available on macOS. On other OSes, install Piper or another engine (see README).';
         ttsVoice.disabled = true;
-        ttsSave.disabled = true;
-        ttsTest.disabled = true;
-        return;
+        if (!ttsHint.textContent) ttsHint.textContent = 'macOS say list unavailable on this OS — use Piper or set LOKI_SAY_VOICE in .env.';
       }}
       if (vd.voices && vd.voices.length) {{
         while (ttsVoice.options.length > 1) ttsVoice.remove(1);
@@ -559,13 +642,15 @@ class LokiWebUI:
         }}
       }}
     }} catch (e) {{
-      ttsHint.textContent = 'Could not load voice list.';
+      ttsHint.textContent = 'Could not load macOS voice list.';
     }}
     try {{
       const sr = await fetch('/api/tts/settings');
       const sd = await sr.json();
       if (!sr.ok) return;
       ttsSpeakReplies.checked = !!sd.tts_enable;
+      ttsEngine.value = (sd.tts_engine === 'piper') ? 'piper' : 'say';
+      refreshTtsEngineUi();
       ttsVoice.value = sd.say_voice || '';
       if (sd.say_rate_wpm == null || sd.say_rate_wpm === '') {{
         ttsRateDefault.checked = true;
@@ -575,15 +660,34 @@ class LokiWebUI:
         if (!isNaN(r)) ttsRate.value = String(Math.min(260, Math.max(100, r)));
       }}
       syncTtsRateDisabled();
+      ttsPiperVoice.value = sd.piper_voice || '';
+      ttsPiperDataDir.value = sd.piper_data_dir || '';
+      ttsPiperBinary.value = sd.piper_binary || '';
+      if (sd.piper_length_scale != null && sd.piper_length_scale !== '') {{
+        ttsPiperLength.value = String(sd.piper_length_scale);
+      }}
+      ttsPiperSpeaker.value = (sd.piper_speaker_id != null && sd.piper_speaker_id !== '') ? String(sd.piper_speaker_id) : '';
       if (sd.settings_path) ttsHint.textContent = 'Settings file: ' + sd.settings_path;
     }} catch (e) {{}}
   }}
 
   async function postTtsSettings() {{
+    let spk = ttsPiperSpeaker.value.trim();
+    let spkOut = null;
+    if (spk !== '') {{
+      const n = parseInt(spk, 10);
+      if (!isNaN(n)) spkOut = n;
+    }}
     const body = {{
+      tts_engine: ttsEngine.value,
       say_voice: ttsVoice.value || '',
       say_rate_wpm: ttsRateDefault.checked ? null : parseInt(ttsRate.value, 10),
-      tts_enable: ttsSpeakReplies.checked
+      tts_enable: ttsSpeakReplies.checked,
+      piper_voice: ttsPiperVoice.value.trim(),
+      piper_data_dir: ttsPiperDataDir.value.trim(),
+      piper_binary: ttsPiperBinary.value.trim(),
+      piper_length_scale: parseFloat(ttsPiperLength.value) || 1.0,
+      piper_speaker_id: spkOut
     }};
     const r = await fetch('/api/tts/settings', {{
       method: 'POST',
@@ -601,6 +705,7 @@ class LokiWebUI:
 
   ttsSave.onclick = async () => {{ await postTtsSettings(); }};
   ttsSpeakReplies.addEventListener('change', async () => {{ await postTtsSettings(); }});
+  ttsEngine.addEventListener('change', async () => {{ refreshTtsEngineUi(); await postTtsSettings(); }});
 
   ttsTest.onclick = async () => {{
     await postTtsSettings();

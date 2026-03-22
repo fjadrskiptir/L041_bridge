@@ -190,6 +190,14 @@ Loki tries xAI embeddings, but will fall back to local hashing embeddings if you
 - **`LOKI_SAY_VOICE`**: macOS `say -v` name (e.g. `Daniel`)
 - **`LOKI_SAY_RATE`**: `say -r` words per minute (empty = system default)
 - **`LOKI_TTS_SETTINGS_PATH`**: JSON file for saved UI voice settings (default `memories/tts_settings.json`)
+- **`LOKI_TTS_ENGINE`**: `say` (default) or **`piper`** for local neural TTS
+- **`LOKI_PIPER_VOICE`**: Piper voice id (default `en_US-lessac-medium`) or path to a `.onnx` model file
+- **`LOKI_PIPER_DATA_DIR`**: folder where downloaded Piper voices live (default `memories/piper_voices`)
+- **`LOKI_PIPER_BINARY`**: legacy `piper` CLI path when using a raw `.onnx` file (default `piper`)
+- **`LOKI_PIPER_MODEL`**: optional explicit `.onnx` path (overrides voice id when set and file exists)
+- **`LOKI_PIPER_LENGTH_SCALE`**: speech length scale for `.onnx` CLI mode (default `1.0`)
+- **`LOKI_PIPER_SPEAKER`**: optional speaker id (integer) for multi-speaker models
+- **`LOKI_PIPER_MODEL_DIR`**: optional folder for `GET /api/tts/piper_onnx_models` when browsing models in the UI
 
 ---
 
@@ -218,23 +226,31 @@ Security note: plugin generation executes code you’re generating. Keep this lo
 **Web UI (recommended)**  
 Open **“Voice & speech (how Loki sounds)”** on the chat page:
 - **Speak replies** — turn spoken answers on/off (independent of “Voice On” for the mic).
-- **Voice** — every voice macOS exposes via `say -v ?` (try **Daniel**, **Tom**, **Fred** for US English male; **Samantha** / **Karen** for female; **Premium** voices need **System Settings → Siri & Spotlight → Siri Voice** downloads).
-- **Speaking rate (WPM)** — slightly **slower** (e.g. 150–175) often sounds more natural than the default.
+- **TTS engine** — **macOS say** or **Piper** (local neural).
+- **macOS say**: **Voice** — every voice macOS exposes via `say -v ?` (try **Daniel**, **Tom**, **Fred** for US English male; **Samantha** / **Karen** for female; **Premium** voices need **System Settings → Siri & Spotlight → Siri Voice** downloads). **Speaking rate (WPM)** — slightly **slower** (e.g. 150–175) often sounds more natural than the default.
+- **Piper**: set **voice id** (e.g. `en_US-lessac-medium`) or full path to a **`.onnx`** model, **data dir** (where voices were downloaded), and optional legacy **binary** / length scale / speaker id.
 - **Save** writes **`memories/tts_settings.json`** so CLI and web share the same profile.
 
 **`.env` (defaults before first save)**  
 - **`LOKI_SAY_VOICE`** — e.g. `Daniel` (empty = system default)  
 - **`LOKI_SAY_RATE`** — words per minute for `say -r` (empty = system default)  
 - **`LOKI_TTS_SETTINGS_PATH`** — override JSON path (default `memories/tts_settings.json`)
+- **`LOKI_TTS_ENGINE=say`** or **`piper`**, plus **`LOKI_PIPER_*`** vars (see **Voice / TTS** above)
+
+**Piper setup (recommended path: Python package)**  
+1. In your venv: `pip install piper-tts` (or `pip install -r requirements-piper.txt`).  
+2. Download a voice, e.g. `./venv/bin/python -m piper.download_voices en_US-lessac-medium` (use `--data-dir memories/piper_voices` if you want them under the project).  
+3. In the Web UI choose **Piper**, set **Piper voice** to that id (or paste the path to `.onnx`), **data dir** to the folder that contains the voice files, **Save**, then **Test voice**.  
+4. Audio plays via **`afplay`** on macOS. If Piper fails (missing install/model), Loki **falls back to `say`** and logs `[tts] Piper synthesis failed`.
 
 **More natural speech (hardware / install)**  
 | Option | Quality | Notes |
 |--------|---------|--------|
 | **macOS `say` + Premium voice** | Good | Download enhanced voices in System Settings; pick them in the UI dropdown. |
-| **[Piper](https://github.com/rhasspy/piper)** | Very good | Local neural TTS; add a small bridge script + model; not wired in-repo yet. |
-| **Cloud APIs** (OpenAI TTS, ElevenLabs, etc.) | Best | Requires keys + network; can be added as a plugin or `LOKI_TTS_ENGINE` later. |
+| **[Piper](https://github.com/OHF-Voice/piper1-gpl)** (wired in-repo) | Very good | Local neural TTS via `piper-tts` or legacy `piper` + `.onnx`. |
+| **Cloud APIs** (OpenAI TTS, ElevenLabs, etc.) | Best | Requires keys + network; can be added as a plugin later. |
 
-Recommendation: tune **`say`** in the UI first; if you outgrow it, plan **Piper** for fully local neural speech.
+Recommendation: tune **`say`** first for zero setup; switch the UI (or `LOKI_TTS_ENGINE=piper`) for **Piper** when you want more natural local speech.
 
 ### STT (you speak to Loki)
 **Feasible.** Options:
@@ -274,5 +290,5 @@ If xAI embeddings return 404/permission errors, Loki uses a **local embedding fa
 - **OCR**: reading text on-screen (e.g. chat apps). Options: `tesseract` or macOS Vision framework.
 - **Better local embeddings**: add a local embedding model later for higher-quality recall.
 - **Safety controls**: “confirm before click”, allowlist apps/regions.
-- **Voice**: Web UI TTS tuning + optional Piper / cloud TTS backends.
+- **Voice**: Web UI TTS tuning; Piper is available locally; optional cloud TTS backends.
 

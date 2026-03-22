@@ -133,6 +133,10 @@ class LokiGUI(tk.Tk):
 
         # TTS uses macOS `say` inside VoiceManager.
         _tts0 = ld.load_tts_settings_merged()
+        try:
+            ld.LOKI_PIPER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         self.voice_mgr = ld.VoiceManager(
             hotkey_char=ld.VOICE_HOTKEY,
             stt_model=ld.VOICE_STT_MODEL,
@@ -145,6 +149,14 @@ class LokiGUI(tk.Tk):
             tts_enable=bool(_tts0["tts_enable"]),
             say_voice=str(_tts0["say_voice"]),
             say_rate_wpm=_tts0["say_rate_wpm"],
+            tts_engine=str(_tts0["tts_engine"]),
+            piper_voice=str(_tts0["piper_voice"]),
+            piper_onnx=_tts0["piper_onnx"],
+            piper_voice_module=str(_tts0["piper_voice_module"]),
+            piper_data_dir=_tts0["piper_data_dir"],
+            piper_binary=str(_tts0["piper_binary"]),
+            piper_length_scale=float(_tts0["piper_length_scale"]),
+            piper_speaker_id=_tts0["piper_speaker_id"],
             stt_task_fn=lambda transcript: self._dispatch_voice_transcript(transcript),
         )
 
