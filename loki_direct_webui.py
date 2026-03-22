@@ -35,7 +35,7 @@ _port_raw = str(_port_raw).strip()
 _port_match = re.search(r"([0-9]+)", _port_raw)
 APP_PORT = int(_port_match.group(1)) if _port_match else 7865
 APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
-WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-22.tts-piper")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-18.piper-voice-pick")
 
 
 class LokiWebUI:
@@ -234,6 +234,27 @@ class LokiWebUI:
                 root = ld.MEMORY_DIR
             return jsonify({"ok": True, "directory": str(root), "models": lpt.list_onnx_in_dir(root)})
 
+        @self.app.route("/api/tts/piper_installed_voices", methods=["GET"])
+        def api_tts_piper_installed_voices():
+            """`.onnx` files in the Piper data dir (from `piper.download_voices`)."""
+
+            import loki_piper_tts as lpt
+
+            d = (request.args.get("data_dir") or "").strip()
+            if d:
+                root = Path(d).expanduser().resolve()
+            else:
+                root = ld.LOKI_PIPER_DATA_DIR
+            voices = lpt.list_installed_piper_voices(root)
+            return jsonify(
+                {
+                    "ok": True,
+                    "data_dir": str(root),
+                    "exists": root.is_dir(),
+                    "voices": voices,
+                }
+            )
+
         @self.app.route("/api/tts/settings", methods=["GET"])
         def api_tts_settings_get():
             if self.voice_mgr is None:
@@ -308,6 +329,10 @@ class LokiWebUI:
     #ttsVoice {{ flex: 2; min-width: 220px; padding: 8px; border-radius: 8px; border: 1px solid #ddd; }}
     #ttsRate {{ flex: 1; min-width: 160px; }}
     .tts-actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    #piperVoiceRadios {{ max-height: 200px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 8px; padding: 8px 10px; background: #fafafa; }}
+    #piperVoiceRadios label {{ display: flex; align-items: center; gap: 8px; margin: 6px 0; cursor: pointer; font-weight: normal; }}
+    #piperVoiceRadios input[type="radio"] {{ margin: 0; }}
+    #piperDownloadHelp summary {{ cursor: pointer; color: #444; }}
   </style>
 </head>
 <body>
@@ -361,14 +386,24 @@ class LokiWebUI:
     </div>
     <div id="piperBlock" style="display:none">
       <div class="tts-row">
-        <label style="flex:2">Piper voice <span class="small">(voice id or path to .onnx)</span><br/>
-          <input type="text" id="ttsPiperVoice" style="width:100%;padding:8px;border-radius:8px;border:1px solid #ddd" placeholder="en_US-lessac-medium"/>
+        <label style="flex:2">Piper data dir <span class="small">(folder where <code>.onnx</code> files live)</span><br/>
+          <input type="text" id="ttsPiperDataDir" style="width:100%;padding:8px;border-radius:8px;border:1px solid #ddd" placeholder="memories/piper_voices"/>
+        </label>
+      </div>
+      <div class="tts-row" style="align-items:flex-end">
+        <button type="button" id="ttsPiperRefreshVoices">Scan folder for voices</button>
+        <span class="small" id="ttsPiperScanHint"></span>
+      </div>
+      <p class="small" style="margin:4px 0 6px 0"><b>Installed voices</b> — pick one (each needs <code>&lt;id&gt;.onnx</code> in the data dir):</p>
+      <div id="piperVoiceRadios" aria-label="Piper installed voices"></div>
+      <div class="tts-row" style="margin-top:10px">
+        <label style="flex:2;display:flex;align-items:center;gap:8px">
+          <input type="radio" name="piperVoicePick" value="__custom__" id="piperPickCustom"/>
+          <span><b>Custom</b> — voice id (e.g. <code>en_GB-alan-medium</code>) or full path to a <code>.onnx</code> file</span>
         </label>
       </div>
       <div class="tts-row">
-        <label style="flex:2">Piper data dir <span class="small">(downloaded voices)</span><br/>
-          <input type="text" id="ttsPiperDataDir" style="width:100%;padding:8px;border-radius:8px;border:1px solid #ddd" placeholder="memories/piper_voices"/>
-        </label>
+        <input type="text" id="ttsPiperVoice" style="width:100%;padding:8px;border-radius:8px;border:1px solid #ddd" placeholder="Used when Custom is selected, or synced when you pick an installed voice above"/>
       </div>
       <div class="tts-row">
         <label style="flex:2">Legacy Piper binary <span class="small">(only if using .onnx file)</span><br/>
@@ -383,7 +418,17 @@ class LokiWebUI:
           <input type="number" id="ttsPiperSpeaker" step="1" style="width:100px;padding:8px" placeholder=""/>
         </label>
       </div>
-      <p class="small">After <code>./venv/bin/python -m piper.download_voices en_US-lessac-medium</code>, use that voice id above and set data dir to where files were saved (often <code>memories/piper_voices</code>).</p>
+      <details id="piperDownloadHelp" style="margin-top:10px">
+        <summary class="small">How to download more Piper voices</summary>
+        <ol class="small" style="margin:8px 0 0 18px;line-height:1.5">
+          <li>In your project venv: <code>pip install piper-tts</code></li>
+          <li><b>List</b> every voice id you can install: <code>./venv/bin/python -m piper.download_voices</code></li>
+          <li><b>Download</b> one into your data dir (use the same path as above):<br/>
+            <code>./venv/bin/python -m piper.download_voices --data-dir <span id="piperHelpDataDirPh">/path/to/piper_voices</span> en_US-lessac-medium</code></li>
+          <li>Click <b>Scan folder for voices</b> here, then select the voice.</li>
+        </ol>
+        <p class="small" style="margin:8px 0 0 0">Samples: <a href="https://rhasspy.github.io/piper-samples" target="_blank" rel="noopener">rhasspy.github.io/piper-samples</a> · Catalog: <a href="https://huggingface.co/rhasspy/piper-voices/tree/main" target="_blank" rel="noopener">Hugging Face piper-voices</a></p>
+      </details>
     </div>
     <div class="tts-actions">
       <button type="button" id="ttsSave">Save voice settings</button>
@@ -606,9 +651,110 @@ class LokiWebUI:
   const ttsPiperBinary = document.getElementById('ttsPiperBinary');
   const ttsPiperLength = document.getElementById('ttsPiperLength');
   const ttsPiperSpeaker = document.getElementById('ttsPiperSpeaker');
+  const ttsPiperRefreshVoices = document.getElementById('ttsPiperRefreshVoices');
+  const piperVoiceRadios = document.getElementById('piperVoiceRadios');
+  const ttsPiperScanHint = document.getElementById('ttsPiperScanHint');
+  const piperPickCustom = document.getElementById('piperPickCustom');
+  const piperHelpDataDirPh = document.getElementById('piperHelpDataDirPh');
   const ttsSave = document.getElementById('ttsSave');
   const ttsTest = document.getElementById('ttsTest');
   const ttsHint = document.getElementById('ttsHint');
+
+  function updatePiperHelpExampleDir() {{
+    const d = ttsPiperDataDir.value.trim();
+    if (piperHelpDataDirPh) piperHelpDataDirPh.textContent = d || '(set Piper data dir above, or use memories/piper_voices)';
+  }}
+  ttsPiperDataDir.addEventListener('input', updatePiperHelpExampleDir);
+
+  function setPiperVoiceFieldReadonly(ro) {{
+    ttsPiperVoice.readOnly = ro;
+    ttsPiperVoice.style.opacity = ro ? '0.85' : '1';
+  }}
+
+  function syncPiperPickFromVoiceField() {{
+    const pv = ttsPiperVoice.value.trim();
+    const radios = piperBlock.querySelectorAll('input[name="piperVoicePick"]');
+    let matched = false;
+    for (const r of radios) {{
+      if (r.value !== '__custom__' && r.value === pv) {{
+        r.checked = true;
+        matched = true;
+        setPiperVoiceFieldReadonly(true);
+        break;
+      }}
+    }}
+    if (!matched) {{
+      if (piperPickCustom) piperPickCustom.checked = true;
+      setPiperVoiceFieldReadonly(false);
+    }}
+  }}
+
+  piperBlock.addEventListener('change', (e) => {{
+    const t = e.target;
+    if (!t || t.name !== 'piperVoicePick') return;
+    if (t.value === '__custom__') {{
+      setPiperVoiceFieldReadonly(false);
+      ttsPiperVoice.focus();
+    }} else {{
+      ttsPiperVoice.value = t.value;
+      setPiperVoiceFieldReadonly(true);
+    }}
+  }});
+
+  ttsPiperVoice.addEventListener('focus', () => {{
+    if (piperPickCustom) piperPickCustom.checked = true;
+    setPiperVoiceFieldReadonly(false);
+  }});
+  ttsPiperVoice.addEventListener('input', () => {{
+    if (piperPickCustom) piperPickCustom.checked = true;
+    setPiperVoiceFieldReadonly(false);
+  }});
+
+  async function refreshPiperInstalledVoices() {{
+    ttsPiperScanHint.textContent = 'Scanning…';
+    piperVoiceRadios.innerHTML = '';
+    const dd = ttsPiperDataDir.value.trim();
+    const q = dd ? ('?data_dir=' + encodeURIComponent(dd)) : '';
+    try {{
+      const r = await fetch('/api/tts/piper_installed_voices' + q);
+      const d = await r.json();
+      if (!r.ok || !d.ok) {{
+        ttsPiperScanHint.textContent = (d && d.error) ? d.error : 'Scan failed';
+        return;
+      }}
+      ttsPiperScanHint.textContent = d.voices && d.voices.length
+        ? (d.voices.length + ' voice(s) in ' + d.data_dir)
+        : ('No .onnx in ' + d.data_dir);
+      if (!d.exists) {{
+        ttsPiperScanHint.textContent = 'Folder not found: ' + d.data_dir;
+        piperVoiceRadios.innerHTML = '<p class="small" style="margin:0">Folder does not exist yet — create it or run download with <code>--data-dir</code> pointing here.</p>';
+        syncPiperPickFromVoiceField();
+        return;
+      }}
+      if (!d.voices || !d.voices.length) {{
+        piperVoiceRadios.innerHTML = '<p class="small" style="margin:0">No <code>.onnx</code> files found. Use <b>How to download more Piper voices</b> below, then scan again.</p>';
+        syncPiperPickFromVoiceField();
+        return;
+      }}
+      for (const v of d.voices) {{
+        const id = v.id;
+        const lab = document.createElement('label');
+        const inp = document.createElement('input');
+        inp.type = 'radio';
+        inp.name = 'piperVoicePick';
+        inp.value = id;
+        lab.appendChild(inp);
+        const hint = v.has_json ? '' : ' — missing .onnx.json?';
+        lab.appendChild(document.createTextNode(id + hint));
+        piperVoiceRadios.appendChild(lab);
+      }}
+      syncPiperPickFromVoiceField();
+    }} catch (err) {{
+      ttsPiperScanHint.textContent = 'Scan failed (network?)';
+    }}
+  }}
+
+  ttsPiperRefreshVoices.onclick = () => {{ refreshPiperInstalledVoices(); }};
 
   function refreshTtsEngineUi() {{
     const p = ttsEngine.value === 'piper';
@@ -668,6 +814,8 @@ class LokiWebUI:
       }}
       ttsPiperSpeaker.value = (sd.piper_speaker_id != null && sd.piper_speaker_id !== '') ? String(sd.piper_speaker_id) : '';
       if (sd.settings_path) ttsHint.textContent = 'Settings file: ' + sd.settings_path;
+      updatePiperHelpExampleDir();
+      if (ttsEngine.value === 'piper') await refreshPiperInstalledVoices();
     }} catch (e) {{}}
   }}
 
@@ -705,7 +853,14 @@ class LokiWebUI:
 
   ttsSave.onclick = async () => {{ await postTtsSettings(); }};
   ttsSpeakReplies.addEventListener('change', async () => {{ await postTtsSettings(); }});
-  ttsEngine.addEventListener('change', async () => {{ refreshTtsEngineUi(); await postTtsSettings(); }});
+  ttsEngine.addEventListener('change', async () => {{
+    refreshTtsEngineUi();
+    if (ttsEngine.value === 'piper') {{
+      updatePiperHelpExampleDir();
+      await refreshPiperInstalledVoices();
+    }}
+    await postTtsSettings();
+  }});
 
   ttsTest.onclick = async () => {{
     await postTtsSettings();

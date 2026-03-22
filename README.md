@@ -228,7 +228,7 @@ Open **“Voice & speech (how Loki sounds)”** on the chat page:
 - **Speak replies** — turn spoken answers on/off (independent of “Voice On” for the mic).
 - **TTS engine** — **macOS say** or **Piper** (local neural).
 - **macOS say**: **Voice** — every voice macOS exposes via `say -v ?` (try **Daniel**, **Tom**, **Fred** for US English male; **Samantha** / **Karen** for female; **Premium** voices need **System Settings → Siri & Spotlight → Siri Voice** downloads). **Speaking rate (WPM)** — slightly **slower** (e.g. 150–175) often sounds more natural than the default.
-- **Piper**: set **voice id** (e.g. `en_US-lessac-medium`) or full path to a **`.onnx`** model, **data dir** (where voices were downloaded), and optional legacy **binary** / length scale / speaker id.
+- **Piper**: set **data dir**, click **Scan folder for voices**, then pick a voice (**radio buttons** for each `*.onnx` found). Use **Custom** to type a voice id or full path to a **`.onnx`** file. Optional legacy **binary** / length scale / speaker id.
 - **Save** writes **`memories/tts_settings.json`** so CLI and web share the same profile.
 
 **`.env` (defaults before first save)**  
@@ -239,9 +239,13 @@ Open **“Voice & speech (how Loki sounds)”** on the chat page:
 
 **Piper setup (recommended path: Python package)**  
 1. In your venv: `pip install piper-tts` (or `pip install -r requirements-piper.txt`).  
-2. Download a voice, e.g. `./venv/bin/python -m piper.download_voices en_US-lessac-medium` (use `--data-dir memories/piper_voices` if you want them under the project).  
-3. In the Web UI choose **Piper**, set **Piper voice** to that id (or paste the path to `.onnx`), **data dir** to the folder that contains the voice files, **Save**, then **Test voice**.  
-4. Audio plays via **`afplay`** on macOS. If Piper fails (missing install/model), Loki **falls back to `say`** and logs `[tts] Piper synthesis failed`.
+2. **See every voice you can install:** `./venv/bin/python -m piper.download_voices` (prints ids like `en_US-lessac-medium`, `en_GB-alan-medium`, …).  
+3. **Download** into your Loki data folder (same path you’ll set in the UI), e.g.  
+   `./venv/bin/python -m piper.download_voices --data-dir memories/piper_voices en_US-lessac-medium`  
+   Repeat with another id to add more voices (each creates `<id>.onnx` + `<id>.onnx.json`).  
+4. In the Web UI choose **Piper**, set **Piper data dir**, **Scan folder for voices**, select a voice, **Save**, then **Test voice**.  
+5. **Browse / preview** voices: [Piper samples](https://rhasspy.github.io/piper-samples) · full catalog on [Hugging Face](https://huggingface.co/rhasspy/piper-voices/tree/main).  
+6. Audio plays via **`afplay`** on macOS. If Piper fails (missing install/model), Loki **falls back to `say`** and logs `[tts] Piper synthesis failed`.
 
 **More natural speech (hardware / install)**  
 | Option | Quality | Notes |

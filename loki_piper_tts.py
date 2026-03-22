@@ -157,3 +157,32 @@ def list_onnx_in_dir(directory: Path) -> List[Dict[str, Any]]:
     for p in sorted(d.glob("*.onnx")):
         out.append({"path": str(p), "name": p.name})
     return out
+
+
+def piper_voice_config_path(onnx_path: Path) -> Path:
+    """Companion JSON next to Piper's `<voice>.onnx` (i.e. `<voice>.onnx.json`)."""
+
+    return Path(str(onnx_path) + ".json")
+
+
+def list_installed_piper_voices(data_dir: Path) -> List[Dict[str, Any]]:
+    """
+    Voices downloaded via `python -m piper.download_voices --data-dir <dir> <voice_id>`
+    appear as `<voice_id>.onnx` (+ `<voice_id>.onnx.json`). Return one entry per .onnx.
+    """
+
+    d = data_dir.resolve()
+    if not d.is_dir():
+        return []
+    out: List[Dict[str, Any]] = []
+    for p in sorted(d.glob("*.onnx")):
+        voice_id = p.stem
+        cfg = piper_voice_config_path(p)
+        out.append(
+            {
+                "id": voice_id,
+                "onnx": str(p),
+                "has_json": cfg.is_file(),
+            }
+        )
+    return out

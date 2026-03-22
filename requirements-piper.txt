@@ -1,0 +1,2 @@
+# Optional: local neural TTS (see README "Piper setup")
+piper-tts
