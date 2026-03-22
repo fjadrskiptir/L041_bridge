@@ -22,15 +22,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import os
+import re
 
 from flask import Flask, jsonify, request
 
 import loki_direct as ld
 
 
-APP_PORT = int(os.environ.get("LOKI_WEB_PORT", "7865"))
+_port_raw = os.environ.get("LOKI_WEB_PORT", "7865")
+_port_raw = str(_port_raw).strip()
+_port_match = re.search(r"([0-9]+)", _port_raw)
+APP_PORT = int(_port_match.group(1)) if _port_match else 7865
 APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
-WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-20.voice-ui-v2")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-21.chat-dup-voice-toggle")
 
 
 class LokiWebUI:
@@ -53,7 +57,6 @@ class LokiWebUI:
             self.screen = None
 
         self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
-        self.system_prompt = self._build_system_prompt()
 
         self.tools = ld.build_core_tools(self.butt, self.screen)
         ld.ensure_plugins_package(ld.PLUGINS_DIR)
@@ -68,7 +71,9 @@ class LokiWebUI:
             self.watcher = ld.MemoryFolderWatcher(ld.INBOX_DIR, ld.PROCESSED_DIR, ld.WATCH_POLL_S, xai=self.xai, vstore=self.vstore)
             self.watcher.start()
 
-        self.messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        self.messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": ld.compose_system_with_time(ld.build_base_system_static(self.memory_text))}
+        ]
 
         self.voice_enabled = True
         self.voice_mgr: Optional[ld.VoiceManager] = ld.VoiceManager(
@@ -82,26 +87,28 @@ class LokiWebUI:
             min_seconds=ld.VOICE_MIN_SECONDS,
             tts_enable=ld.VOICE_TTS_ENABLE,
             say_voice=ld.VOICE_SAY_VOICE,
-            stt_task_fn=lambda transcript: self.handle_text(transcript, from_voice=True),
+            stt_task_fn=self._on_voice_transcript,
         )
         # Do NOT start hotkey listener; this UI drives start/stop recording.
 
         self._register_routes()
         print(f"[webui] version={WEBUI_VERSION} starting at http://{APP_HOST}:{APP_PORT}", flush=True)
 
-    def _build_system_prompt(self) -> str:
-        base = (
-            "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
-            "Be concise, careful, and confirm risky actions.\n"
-            "When a tool is appropriate, call it.\n"
-            "For visual understanding, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
-        )
-        if self.memory_text:
-            base += "\nUser memory (treat as true unless contradicted):\n" + self.memory_text
-        return base
-
     def _enqueue_event(self, role: str, text: str) -> None:
         self.ui_events.put({"role": role, "text": text})
+
+    def _on_voice_transcript(self, transcript: str) -> None:
+        """STT callback: push chat lines to the event queue (voice has no /api/send client echo)."""
+
+        t = (transcript or "").strip()
+        if not t:
+            return
+        self._enqueue_event("user", t)
+        try:
+            assistant = self.handle_text(t, from_voice=True, blocking=True)
+        except Exception as e:
+            assistant = f"[error] {e}"
+        self._enqueue_event("assistant", assistant)
 
     def _register_routes(self) -> None:
         @self.app.route("/")
@@ -122,7 +129,7 @@ class LokiWebUI:
             text = (data.get("text") or "").strip()
             if not text:
                 return jsonify({"ok": False, "error": "empty text"}), 400
-            self._enqueue_event("user", text)
+            # User line is shown immediately in the browser; do not also enqueue it (poll would duplicate).
             # Synchronous chat is simplest for reliability.
             try:
                 assistant = self.handle_text(text, from_voice=False, blocking=True)
@@ -147,6 +154,11 @@ class LokiWebUI:
         def api_voice_toggle():
             data = request.get_json(force=True) or {}
             self.voice_enabled = bool(data.get("enabled", True))
+            if not self.voice_enabled and self.voice_mgr is not None:
+                try:
+                    self.voice_mgr.stop_recording()
+                except Exception:
+                    pass
             return jsonify({"ok": True, "enabled": self.voice_enabled})
 
         @self.app.route("/api/voice/start", methods=["POST"])
@@ -266,11 +278,18 @@ class LokiWebUI:
       const r = await fetch('/api/voice/status');
       if (!r.ok) return;
       const d = await r.json();
+      // Checkbox is the UI source of truth; server enforces on /api/voice/start and TTS in _run_model_turn.
+      const voiceOn = !!voiceToggle.checked;
       if (!d.recording) {{
         holding = false;
-        holdBtn.disabled = !voiceToggle.checked;
-        stopBtn.disabled = !voiceToggle.checked;
-        status.textContent = 'Idle';
+        holdBtn.disabled = !voiceOn;
+        stopBtn.disabled = true;
+        if (status.textContent === 'Listening...' || status.textContent === 'Processing...') {{
+          status.textContent = 'Idle';
+        }}
+      }} else {{
+        holdBtn.disabled = true;
+        stopBtn.disabled = false;
       }}
     }} catch (e) {{
       // ignore
@@ -279,9 +298,11 @@ class LokiWebUI:
   
   setInterval(syncVoiceUI, 500);
 
+  let sendInFlight = false;
   sendBtn.onclick = async () => {{
     const text = input.value.trim();
-    if (!text) return;
+    if (!text || sendInFlight) return;
+    sendInFlight = true;
     add('user', text);
     input.value = '';
     status.textContent = 'Thinking...';
@@ -292,17 +313,21 @@ class LokiWebUI:
         body: JSON.stringify({{text}})
       }});
     }} finally {{
+      sendInFlight = false;
       status.textContent = 'Idle';
     }}
   }};
 
   input.addEventListener('keydown', (e) => {{
-    if (e.key === 'Enter') sendBtn.click();
+    if (e.key === 'Enter') {{
+      e.preventDefault();
+      if (!sendInFlight) sendBtn.click();
+    }}
   }});
 
   voiceToggle.onchange = async () => {{
     holdBtn.disabled = !voiceToggle.checked;
-    stopBtn.disabled = !voiceToggle.checked;
+    stopBtn.disabled = true;
     await fetch('/api/voice/toggle', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
@@ -326,6 +351,7 @@ class LokiWebUI:
     try {{ if (r && r.ok) {{ setTimeout(() => status.textContent = 'Idle', 600); }} }} catch (e) {{}}
     // Always reset promptly even if stop failed (prevents stuck button).
     holdBtn.disabled = !voiceToggle.checked;
+    stopBtn.disabled = true;
     holding = false;
     setTimeout(() => status.textContent = 'Idle', 300);
   }}
@@ -352,6 +378,7 @@ class LokiWebUI:
     }} catch (err) {{
       holding = false;
       holdBtn.disabled = !voiceToggle.checked;
+      stopBtn.disabled = true;
       status.textContent = 'Voice error';
       if (safetyTimer) clearTimeout(safetyTimer);
     }}
@@ -432,7 +459,7 @@ class LokiWebUI:
             user_in = f"/attach {autop}"
 
         if user_in == "/help":
-            return "Commands: /tools, /scan, /mem, /attach <path>, /ingest <path>, /compile_mem, /set_screen left <i>, /autodetect_screens, /upgrade <req>"
+            return "Commands: /tools, /scan, /mem, /attach <path>, /ingest <path>, /compile_mem, /set_screen left <i>, /autodetect_screens, /upgrade <req> — time: get_current_time; macOS Calendar: apple_calendar_* tools"
 
         if user_in == "/tools":
             return "\n".join(self.tools.list_names())
@@ -442,8 +469,7 @@ class LokiWebUI:
 
         if user_in == "/mem":
             self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
-            self.system_prompt = self._build_system_prompt()
-            self.messages[0]["content"] = self.system_prompt
+            ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
             return f"[memory] Reloaded {ld.MEMORY_DIR}"
 
         if user_in.startswith("/set_screen "):
@@ -544,6 +570,7 @@ class LokiWebUI:
         return self._run_model_turn()
 
     def _run_model_turn(self) -> str:
+        ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
         resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
         msg = ld.extract_assistant_message(resp)
 
@@ -599,6 +626,7 @@ class LokiWebUI:
                     }
                 )
 
+            ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
             resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
             msg = ld.extract_assistant_message(resp)
 
@@ -608,7 +636,8 @@ class LokiWebUI:
 
         self.messages.append({"role": "assistant", "content": content})
 
-        if self.voice_mgr:
+        # TTS only when Voice On is enabled (checkbox syncs /api/voice/toggle).
+        if self.voice_enabled and self.voice_mgr:
             try:
                 self.voice_mgr.speak(str(content))
             except Exception:

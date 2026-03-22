@@ -27,6 +27,12 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore[misc, assignment]
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -115,6 +121,12 @@ RETRIEVAL_K = int(os.getenv("LOKI_RETRIEVAL_K", "6"))
 WATCH_MEMORY_FOLDER = os.getenv("LOKI_WATCH_MEMORY_FOLDER", "1").strip() not in {"0", "false", "False", "no", "NO"}
 WATCH_POLL_S = float(os.getenv("LOKI_WATCH_POLL_S", "2.0"))
 LOKI_MAX_SCREENSHOT_IMAGES = int(os.getenv("LOKI_MAX_SCREENSHOT_IMAGES", "4"))
+
+# Authoritative clock in system prompt (epoch + ISO) — helps models reason about real dates/timelines.
+LOKI_TIME_SYSTEM_PROMPT = os.getenv("LOKI_TIME_SYSTEM_PROMPT", "1").strip() not in {"0", "false", "False", "no", "NO"}
+# macOS Calendar.app automation (JavaScript for Automation). Disable with LOKI_APPLE_CALENDAR=0.
+LOKI_APPLE_CALENDAR = os.getenv("LOKI_APPLE_CALENDAR", "1").strip() not in {"0", "false", "False", "no", "NO"}
+LOKI_APPLE_CALENDAR_DEFAULT = (os.getenv("LOKI_APPLE_CALENDAR_DEFAULT", "Calendar") or "Calendar").strip()
 VOICE_ENABLE = os.getenv("LOKI_VOICE_ENABLE", "1").strip() not in {"0", "false", "False", "no", "NO"}
 VOICE_HOTKEY = os.getenv("LOKI_VOICE_HOTKEY", "ctrl_l").strip().lower() or "ctrl_l"
 VOICE_STT_MODEL = os.getenv("LOKI_VOICE_STT_MODEL", "base").strip() or "base"
@@ -1596,6 +1608,96 @@ def generate_plugin(xai: XAIClient, request_text: str) -> Dict[str, str]:
 
 
 # -----------------------------
+# Time context (epoch + ISO) for reliable real-world dates
+# -----------------------------
+
+
+def get_time_context_dict(iana_timezone: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Return a JSON-serializable snapshot of "now".
+    `epoch_seconds_utc` is the usual Unix timestamp (seconds since 1970-01-01 UTC).
+    """
+
+    if iana_timezone and ZoneInfo is not None:
+        try:
+            now = datetime.now(ZoneInfo(iana_timezone))
+        except Exception:
+            now = datetime.now().astimezone()
+    else:
+        now = datetime.now().astimezone()
+    utc = datetime.now(timezone.utc)
+    tz_label = str(now.tzinfo) if now.tzinfo else "local"
+    if now.tzinfo is not None and ZoneInfo is not None:
+        try:
+            tz_label = getattr(now.tzinfo, "key", tz_label)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return {
+        "epoch_seconds_utc": int(utc.timestamp()),
+        "epoch_seconds_local_offset": int(now.timestamp()),
+        "iso_local": now.isoformat(timespec="seconds"),
+        "iso_utc": utc.replace(tzinfo=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "timezone": tz_label,
+        "weekday_local": now.strftime("%A"),
+        "date_local": now.strftime("%Y-%m-%d"),
+        "iana_timezone_requested": iana_timezone or "",
+    }
+
+
+def time_context_prompt_block() -> str:
+    d = get_time_context_dict()
+    return (
+        "### Current time (authoritative — do not guess from training data)\n"
+        f"- **Unix epoch seconds (UTC-based instant)**: `{d['epoch_seconds_utc']}`\n"
+        f"- **ISO 8601 local**: `{d['iso_local']}`\n"
+        f"- **ISO 8601 UTC**: `{d['iso_utc']}`\n"
+        f"- **Timezone**: `{d['timezone']}`\n"
+        f"- **Local date / weekday**: `{d['date_local']}` / `{d['weekday_local']}`\n"
+        "Resolve relative phrases (“tomorrow”, “next Friday”) using the local date above, or call `get_current_time`. "
+        "For calendar events, prefer ISO 8601 with offset (e.g. `2026-03-20T15:30:00-07:00`).\n"
+    )
+
+
+def compose_system_with_time(static_base: str) -> str:
+    static_base = (static_base or "").rstrip()
+    if not LOKI_TIME_SYSTEM_PROMPT:
+        return static_base
+    return static_base + "\n\n" + time_context_prompt_block()
+
+
+def refresh_system_time_message(messages: List[Dict[str, Any]], static_base: str) -> None:
+    """Refresh the first system message so every model call sees up-to-date clock + epoch."""
+
+    content = compose_system_with_time(static_base)
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = content
+    else:
+        messages.insert(0, {"role": "system", "content": content})
+
+
+def build_base_system_static(memory_text: str) -> str:
+    """Core system instructions + snapshot memory (no clock block — clock is added per request)."""
+
+    base = (
+        "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
+        "Be concise, careful, and confirm risky actions.\n"
+        "When a tool is appropriate, call it.\n"
+        "For visual understanding of the desktop, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
+        "You receive an authoritative **clock block** (Unix epoch + ISO timestamps) on every model call—use it for real-world dates and timelines; "
+        "when in doubt call `get_current_time`.\n"
+    )
+    if LOKI_APPLE_CALENDAR and sys.platform == "darwin":
+        base += (
+            "On macOS you can use `apple_calendar_*` tools to read and modify the user's Apple Calendar (Calendar.app). "
+            f"If the user does not name a calendar, prefer `{LOKI_APPLE_CALENDAR_DEFAULT}` (override via LOKI_APPLE_CALENDAR_DEFAULT). "
+            "Always confirm before deleting events.\n"
+        )
+    if memory_text:
+        base += "\nUser memory (treat as true unless contradicted):\n" + memory_text
+    return base
+
+
+# -----------------------------
 # App
 # -----------------------------
 
@@ -1803,6 +1905,188 @@ def build_core_tools(butt: ButtplugController, screen: Optional[ScreenController
             )
         )
 
+    def _tool_get_current_time(iana_timezone: str = "") -> str:
+        tz = (iana_timezone or "").strip() or None
+        return json.dumps(get_time_context_dict(tz))
+
+    tools.register(
+        ToolSpec(
+            name="get_current_time",
+            description=(
+                "Return authoritative current time: Unix epoch seconds, ISO local/UTC, local date/weekday, timezone. "
+                "Use whenever 'now', relative dates, or scheduling accuracy matters."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "iana_timezone": {
+                        "type": "string",
+                        "description": "Optional IANA timezone, e.g. America/Los_Angeles (default: machine local).",
+                    }
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            fn=_tool_get_current_time,
+        )
+    )
+
+    if LOKI_APPLE_CALENDAR and sys.platform == "darwin":
+        try:
+            import loki_apple_calendar as lac  # type: ignore
+        except Exception:
+            lac = None
+        if lac is not None:
+            _def_cal = LOKI_APPLE_CALENDAR_DEFAULT
+
+            tools.register(
+                ToolSpec(
+                    name="apple_calendar_list_calendars",
+                    description="List Apple Calendar calendar names from Calendar.app (macOS automation).",
+                    parameters={"type": "object", "properties": {}, "additionalProperties": False},
+                    fn=lambda: lac.list_calendars(),
+                )
+            )
+
+            def _cal_list_events(start_iso: str, end_iso: str, calendar_name: str = "") -> str:
+                return lac.list_events(str(start_iso), str(end_iso), str(calendar_name or ""))
+
+            tools.register(
+                ToolSpec(
+                    name="apple_calendar_list_events",
+                    description=(
+                        "List Calendar events with start times between start_iso and end_iso (ISO 8601). "
+                        "Optionally filter to a single calendar_name from apple_calendar_list_calendars."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "start_iso": {"type": "string"},
+                            "end_iso": {"type": "string"},
+                            "calendar_name": {"type": "string"},
+                        },
+                        "required": ["start_iso", "end_iso"],
+                        "additionalProperties": False,
+                    },
+                    fn=_cal_list_events,
+                )
+            )
+
+            def _cal_create(
+                title: str,
+                start_iso: str,
+                end_iso: str,
+                calendar_name: str = "",
+                location: str = "",
+                notes: str = "",
+                allday: bool = False,
+            ) -> str:
+                return lac.create_event(
+                    str(calendar_name or _def_cal),
+                    str(title),
+                    str(start_iso),
+                    str(end_iso),
+                    str(location or ""),
+                    str(notes or ""),
+                    bool(allday),
+                )
+
+            tools.register(
+                ToolSpec(
+                    name="apple_calendar_create_event",
+                    description=(
+                        "Create an Apple Calendar event. "
+                        f"If calendar_name is omitted, uses default `{_def_cal}` (set LOKI_APPLE_CALENDAR_DEFAULT). "
+                        "Use ISO 8601 with offset for start_iso/end_iso."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "start_iso": {"type": "string"},
+                            "end_iso": {"type": "string"},
+                            "calendar_name": {"type": "string"},
+                            "location": {"type": "string"},
+                            "notes": {"type": "string"},
+                            "allday": {"type": "boolean"},
+                        },
+                        "required": ["title", "start_iso", "end_iso"],
+                        "additionalProperties": False,
+                    },
+                    fn=_cal_create,
+                )
+            )
+
+            def _cal_delete(calendar_name: str = "", event_uid: str = "") -> str:
+                return lac.delete_event(str(calendar_name or _def_cal), str(event_uid))
+
+            tools.register(
+                ToolSpec(
+                    name="apple_calendar_delete_event",
+                    description=(
+                        "Permanently delete a calendar event by event_uid (from list_events). "
+                        "Always confirm with the user before calling this."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "calendar_name": {"type": "string"},
+                            "event_uid": {"type": "string"},
+                        },
+                        "required": ["event_uid"],
+                        "additionalProperties": False,
+                    },
+                    fn=_cal_delete,
+                )
+            )
+
+            def _cal_update(
+                event_uid: str,
+                calendar_name: str = "",
+                title: str = "",
+                start_iso: str = "",
+                end_iso: str = "",
+                location: Optional[str] = None,
+                notes: Optional[str] = None,
+                allday: Optional[bool] = None,
+            ) -> str:
+                return lac.update_event(
+                    str(calendar_name or _def_cal),
+                    str(event_uid),
+                    str(title or ""),
+                    str(start_iso or ""),
+                    str(end_iso or ""),
+                    location,
+                    notes,
+                    allday,
+                )
+
+            tools.register(
+                ToolSpec(
+                    name="apple_calendar_update_event",
+                    description=(
+                        "Update an existing Apple Calendar event by event_uid. "
+                        "Only non-empty fields are applied (except location/notes/allday when explicitly provided)."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "event_uid": {"type": "string"},
+                            "calendar_name": {"type": "string"},
+                            "title": {"type": "string"},
+                            "start_iso": {"type": "string"},
+                            "end_iso": {"type": "string"},
+                            "location": {"type": "string"},
+                            "notes": {"type": "string"},
+                            "allday": {"type": "boolean"},
+                        },
+                        "required": ["event_uid"],
+                        "additionalProperties": False,
+                    },
+                    fn=_cal_update,
+                )
+            )
+
     return tools
 
 
@@ -1822,6 +2106,11 @@ def print_banner() -> None:
     print("  /tools (list tool names)")
     print("  /scan (scan Intiface devices)")
     print("  /upgrade <request>   (e.g. /upgrade add tts)")
+    if LOKI_APPLE_CALENDAR and sys.platform == "darwin":
+        print("  Time: clock + epoch in system prompt; tool get_current_time")
+        print(f"  Apple Calendar tools (Calendar.app); default calendar: {LOKI_APPLE_CALENDAR_DEFAULT!r}")
+    else:
+        print("  Time: clock + epoch in system prompt; tool get_current_time")
     print("  /quit")
 
 
@@ -1906,16 +2195,9 @@ def main() -> int:
         watcher.start()
         print(f"[watch] Watching inbox {INBOX_DIR} (poll {WATCH_POLL_S:.1f}s)")
 
-    base_system = (
-        "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
-        "Be concise, careful, and confirm risky actions.\n"
-        "When a tool is appropriate, call it.\n"
-        "For visual understanding of the desktop, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
-    )
-    if memory_text:
-        base_system += "\nUser memory (treat as true unless contradicted):\n" + memory_text
+    base_system_static = build_base_system_static(memory_text)
 
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": base_system}]
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": compose_system_with_time(base_system_static)}]
 
     chat_lock = threading.Lock()
     voice_mgr: Optional[VoiceManager] = None
@@ -1949,6 +2231,7 @@ def main() -> int:
                 messages.append({"role": "user", "content": user_in})
 
             # Call xAI with tools enabled.
+            refresh_system_time_message(messages, base_system_static)
             resp = xai.chat(messages, tools=tools.list_specs_for_model())
             msg = extract_assistant_message(resp)
 
@@ -2023,6 +2306,7 @@ def main() -> int:
                         }
                     )
 
+                refresh_system_time_message(messages, base_system_static)
                 resp = xai.chat(messages, tools=tools.list_specs_for_model())
                 msg = extract_assistant_message(resp)
 
@@ -2145,15 +2429,12 @@ def main() -> int:
 
         if user_in == "/mem":
             memory_text, memory_warnings = load_memories(MEMORY_DIR)
-            base_system2 = (
-                "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
-                "Be concise, careful, and confirm risky actions.\n"
-                "When a tool is appropriate, call it.\n"
-                "For visual understanding of the desktop, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
-            )
-            if memory_text:
-                base_system2 += "\nUser memory (treat as true unless contradicted):\n" + memory_text
-            messages = [{"role": "system", "content": base_system2}] + [m for m in messages if m.get("role") != "system"][0:]
+            if memory_warnings:
+                for w in memory_warnings:
+                    print(f"[memory] {w}")
+            base_system_static = build_base_system_static(memory_text)
+            tail = [m for m in messages if m.get("role") != "system"]
+            messages = [{"role": "system", "content": compose_system_with_time(base_system_static)}] + tail
             print(f"[memory] Reloaded {MEMORY_DIR}")
             continue
 
@@ -2298,6 +2579,7 @@ def main() -> int:
                 messages.append({"role": "user", "content": user_in})
 
         try:
+            refresh_system_time_message(messages, base_system_static)
             resp = xai.chat(messages, tools=tools.list_specs_for_model())
             msg = extract_assistant_message(resp)
         except Exception as e:
@@ -2378,6 +2660,7 @@ def main() -> int:
                 )
 
             try:
+                refresh_system_time_message(messages, base_system_static)
                 resp = xai.chat(messages, tools=tools.list_specs_for_model())
                 msg = extract_assistant_message(resp)
             except Exception as e:

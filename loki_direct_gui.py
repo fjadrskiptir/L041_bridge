@@ -47,7 +47,6 @@ class LokiGUI(tk.Tk):
 
         # Memory (snapshot prompt)
         self.memory_text, _mem_warnings = ld.load_memories(ld.MEMORY_DIR)
-        self._refresh_system_prompt()
 
         # Tools + plugins
         self.tools = ld.build_core_tools(self.butt, self.screen)
@@ -64,7 +63,9 @@ class LokiGUI(tk.Tk):
             self.watcher.start()
 
         # Conversation messages
-        self.messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        self.messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": ld.compose_system_with_time(ld.build_base_system_static(self.memory_text))}
+        ]
 
         # Voice manager (button-driven)
         self.voice_enabled = True
@@ -201,15 +202,9 @@ class LokiGUI(tk.Tk):
         self.chat_log.see(tk.END)
 
     def _refresh_system_prompt(self) -> None:
-        base = (
-            "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
-            "Be concise, careful, and confirm risky actions.\n"
-            "When a tool is appropriate, call it.\n"
-            "For visual understanding, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
-        )
-        if self.memory_text:
-            base += "\nUser memory (treat as true unless contradicted):\n" + self.memory_text
-        self.system_prompt = base
+        """Reload snapshot memory into the system message (clock refreshed on each model call)."""
+
+        ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
 
     def _on_send_clicked(self) -> None:
         text = self.input_var.get().strip()
@@ -256,7 +251,6 @@ class LokiGUI(tk.Tk):
         if user_in == "/mem":
             self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
             self._refresh_system_prompt()
-            self.messages[0]["content"] = self.system_prompt
             self._ui_append("system", f"[memory] Reloaded {ld.MEMORY_DIR}")
             return
 
@@ -388,6 +382,7 @@ class LokiGUI(tk.Tk):
         self._run_model_turn()
 
     def _run_model_turn(self) -> None:
+        ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
         resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
         msg = ld.extract_assistant_message(resp)
 
@@ -445,6 +440,7 @@ class LokiGUI(tk.Tk):
                     }
                 )
 
+            ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
             resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
             msg = ld.extract_assistant_message(resp)
 

@@ -17,10 +17,12 @@ echo "[webui] Launching Loki Direct Web UI..."
 echo "[webui] URL: $URL"
 echo "[webui] Log: $LOG"
 
-# Choose a free port if the default is busy.
-PORT="$(echo "$URL" | sed -E 's#.*:([0-9]+)/.*#\1#')"
+# Extract host/port from URL. Handles both:
+# - http://127.0.0.1:7865
+# - http://127.0.0.1:7865/some/path
+PORT="$(echo "$URL" | sed -E 's/^.*:([0-9]+).*$/\1/')"
 if [ -z "$PORT" ]; then PORT="7865"; fi
-HOST="$(echo "$URL" | sed -E 's#http://([^:/]+).*#\1#')"
+HOST="$(echo "$URL" | sed -E 's/^.*:\/+([^:/]+)(:.*)?$/\1/')"
 if [ -z "$HOST" ]; then HOST="127.0.0.1"; fi
 
 while true; do

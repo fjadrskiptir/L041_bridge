@@ -7,6 +7,8 @@ Run a local “Grok companion” that can:
 - **Ingest text/images/PDFs into persistent memory** (SQLite vector store).
 - **Dropbox-style memory inbox**: drop files into `memories/inbox/` and Loki auto-processes + recalls them later.
 - **Self-upgrade via plugins**: ask “add X” and Loki can generate a plugin file in `loki_plugins/`.
+- **Authoritative time**: every model call includes **Unix epoch + ISO 8601** local/UTC in the system prompt; tool **`get_current_time`** for explicit checks.
+- **Apple Calendar (macOS)**: read/create/update/delete events in **Calendar.app** via automation tools (optional).
 
 This repo is evolving toward a fully local AI companion loop: perception (screen/files), action (desktop/toys), and memory (searchable recall).
 
@@ -175,6 +177,13 @@ Loki tries xAI embeddings, but will fall back to local hashing embeddings if you
 
 ### Networking
 - **`LOKI_HTTP_TIMEOUT_S`**: default `60`
+
+### Time
+- **`LOKI_TIME_SYSTEM_PROMPT`**: `1` (on) / `0` (off) — inject epoch + ISO clock block every model call
+
+### Apple Calendar (macOS only)
+- **`LOKI_APPLE_CALENDAR`**: `1` (on) / `0` (off)
+- **`LOKI_APPLE_CALENDAR_DEFAULT`**: default calendar name when unspecified (default `Calendar`)
 
 ---
 
