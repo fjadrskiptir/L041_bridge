@@ -138,6 +138,17 @@ VOICE_MAX_SECONDS = float(os.getenv("LOKI_VOICE_MAX_SECONDS", "20"))
 VOICE_MIN_SECONDS = float(os.getenv("LOKI_VOICE_MIN_SECONDS", "0.6"))
 VOICE_TTS_ENABLE = os.getenv("LOKI_VOICE_TTS_ENABLE", "1").strip() not in {"0", "false", "False", "no", "NO"}
 VOICE_SAY_VOICE = os.getenv("LOKI_SAY_VOICE", "").strip()
+# macOS `say -r` words per minute; empty = system default (omit flag)
+_say_rate_raw = os.getenv("LOKI_SAY_RATE", "").strip()
+VOICE_SAY_RATE_WPM: Optional[int] = None
+if _say_rate_raw:
+    try:
+        _sr = int(_say_rate_raw)
+        if _sr > 0:
+            VOICE_SAY_RATE_WPM = _sr
+    except ValueError:
+        pass
+TTS_SETTINGS_PATH = Path(os.getenv("LOKI_TTS_SETTINGS_PATH", str(MEMORY_DIR / "tts_settings.json"))).resolve()
 LOKI_SCREENSHOT_ON_ERROR_BLANK = os.getenv("LOKI_SCREENSHOT_ON_ERROR_BLANK", "0").strip().lower() in {
     "1",
     "true",
@@ -680,6 +691,97 @@ class ScreenController:
 # Voice (hold-to-speak + TTS)
 # -----------------------------
 
+
+def list_macos_say_voices() -> List[Dict[str, str]]:
+    """Parse `say -v ?` on macOS. Returns [{id, locale, sample}, ...]."""
+
+    if sys.platform != "darwin":
+        return []
+    try:
+        proc = subprocess.run(
+            ["say", "-v", "?"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        txt = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    except Exception:
+        return []
+    out: List[Dict[str, str]] = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^(.+?)\s{2,}(\S+)\s+#\s*(.*)$", line)
+        if m:
+            out.append(
+                {
+                    "id": m.group(1).strip(),
+                    "locale": m.group(2).strip(),
+                    "sample": m.group(3).strip(),
+                }
+            )
+            continue
+        parts = re.split(r"\s{2,}", line, maxsplit=2)
+        if not parts or not parts[0].strip():
+            continue
+        vid = parts[0].strip()
+        loc = parts[1].strip() if len(parts) > 1 else ""
+        samp = ""
+        if len(parts) > 2:
+            samp = parts[2].lstrip("# ").strip()
+        out.append({"id": vid, "locale": loc, "sample": samp})
+    # Stable sort: English locales first-ish, then name
+    try:
+        out.sort(key=lambda x: (not str(x.get("locale", "")).lower().startswith("en"), x.get("id", "").lower()))
+    except Exception:
+        out.sort(key=lambda x: x.get("id", "").lower())
+    return out
+
+
+def load_tts_settings_merged(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Merge JSON file (if any) with env defaults."""
+
+    p = (path or TTS_SETTINGS_PATH).resolve()
+    raw: Dict[str, Any] = {}
+    try:
+        if p.exists():
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raw = {}
+    except Exception:
+        raw = {}
+    voice = raw.get("say_voice")
+    if not isinstance(voice, str) or not voice.strip():
+        voice = VOICE_SAY_VOICE
+    rate = raw.get("say_rate_wpm")
+    rate_out: Optional[int]
+    if rate is None or rate == "":
+        rate_out = VOICE_SAY_RATE_WPM
+    else:
+        try:
+            r = int(rate)
+            rate_out = r if r > 0 else None
+        except (TypeError, ValueError):
+            rate_out = VOICE_SAY_RATE_WPM
+    te = raw.get("tts_enable")
+    if isinstance(te, bool):
+        tts_enable = te
+    else:
+        tts_enable = VOICE_TTS_ENABLE
+    return {
+        "say_voice": str(voice).strip(),
+        "say_rate_wpm": rate_out,
+        "tts_enable": bool(tts_enable),
+    }
+
+
+def save_tts_settings_file(data: Dict[str, Any], path: Optional[Path] = None) -> None:
+    p = (path or TTS_SETTINGS_PATH).resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 class VoiceManager:
     def __init__(
         self,
@@ -694,6 +796,7 @@ class VoiceManager:
         min_seconds: float,
         tts_enable: bool,
         say_voice: str,
+        say_rate_wpm: Optional[int] = None,
         stt_task_fn: Callable[[str], None],
     ):
         self.hotkey_spec = str(hotkey_char).strip().lower()
@@ -704,9 +807,16 @@ class VoiceManager:
         self.channels = int(channels)
         self.max_seconds = float(max_seconds)
         self.min_seconds = float(min_seconds)
-        self.tts_enable = tts_enable
-        self.say_voice = say_voice
+        self.tts_enable = bool(tts_enable)
+        self.say_voice = (say_voice or "").strip()
+        try:
+            _sr = int(say_rate_wpm) if say_rate_wpm is not None else 0
+        except (TypeError, ValueError):
+            _sr = 0
+        self.say_rate_wpm: Optional[int] = _sr if _sr > 0 else None
         self.stt_task_fn = stt_task_fn
+
+        self._tts_settings_lock = threading.Lock()
 
         self._listening = False
         self._recording = False
@@ -723,8 +833,49 @@ class VoiceManager:
 
         self._kb_listener = None
 
+    def tts_settings_snapshot(self) -> Dict[str, Any]:
+        with self._tts_settings_lock:
+            return {
+                "say_voice": self.say_voice,
+                "say_rate_wpm": self.say_rate_wpm,
+                "tts_enable": self.tts_enable,
+            }
+
+    def update_tts_settings(
+        self,
+        *,
+        say_voice: Optional[str] = None,
+        say_rate_wpm: Any = None,
+        tts_enable: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Update TTS parameters (thread-safe). Use say_rate_wpm=None or '' for system default."""
+
+        with self._tts_settings_lock:
+            if say_voice is not None:
+                self.say_voice = str(say_voice).strip()
+            if say_rate_wpm is not None:
+                if say_rate_wpm in ("", None):
+                    self.say_rate_wpm = None
+                else:
+                    try:
+                        r = int(say_rate_wpm)
+                        self.say_rate_wpm = r if r > 0 else None
+                    except (TypeError, ValueError):
+                        pass
+            if tts_enable is not None:
+                self.tts_enable = bool(tts_enable)
+            return {
+                "say_voice": self.say_voice,
+                "say_rate_wpm": self.say_rate_wpm,
+                "tts_enable": self.tts_enable,
+            }
+
     def _tts_say(self, text: str) -> None:
-        if not self.tts_enable:
+        with self._tts_settings_lock:
+            tts_on = self.tts_enable
+            voice = self.say_voice
+            rate = self.say_rate_wpm
+        if not tts_on:
             return
         text = (text or "").strip()
         if not text:
@@ -737,8 +888,10 @@ class VoiceManager:
                 pass
 
             cmd = ["say"]
-            if self.say_voice:
-                cmd += ["-v", self.say_voice]
+            if voice:
+                cmd += ["-v", voice]
+            if rate and int(rate) > 0:
+                cmd += ["-r", str(int(rate))]
             cmd += [text]
             try:
                 self._tts_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2330,6 +2483,7 @@ def main() -> int:
         print("- Microphone (for recording)")
         print("- Input Monitoring + Accessibility (for global hotkey listening via pynput)")
         try:
+            _tts0 = load_tts_settings_merged()
             voice_mgr = VoiceManager(
                 hotkey_char=VOICE_HOTKEY,
                 stt_model=VOICE_STT_MODEL,
@@ -2339,8 +2493,9 @@ def main() -> int:
                 channels=VOICE_CHANNELS,
                 max_seconds=VOICE_MAX_SECONDS,
                 min_seconds=VOICE_MIN_SECONDS,
-                tts_enable=VOICE_TTS_ENABLE,
-                say_voice=VOICE_SAY_VOICE,
+                tts_enable=bool(_tts0["tts_enable"]),
+                say_voice=str(_tts0["say_voice"]),
+                say_rate_wpm=_tts0["say_rate_wpm"],
                 stt_task_fn=_voice_stt_task,
             )
             voice_mgr.start()

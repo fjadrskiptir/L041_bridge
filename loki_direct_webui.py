@@ -34,7 +34,7 @@ _port_raw = str(_port_raw).strip()
 _port_match = re.search(r"([0-9]+)", _port_raw)
 APP_PORT = int(_port_match.group(1)) if _port_match else 7865
 APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
-WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-21.chat-dup-voice-toggle")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-21.tts-voice-panel")
 
 
 class LokiWebUI:
@@ -76,6 +76,7 @@ class LokiWebUI:
         ]
 
         self.voice_enabled = True
+        _tts0 = ld.load_tts_settings_merged()
         self.voice_mgr: Optional[ld.VoiceManager] = ld.VoiceManager(
             hotkey_char=ld.VOICE_HOTKEY,
             stt_model=ld.VOICE_STT_MODEL,
@@ -85,8 +86,9 @@ class LokiWebUI:
             channels=ld.VOICE_CHANNELS,
             max_seconds=ld.VOICE_MAX_SECONDS,
             min_seconds=ld.VOICE_MIN_SECONDS,
-            tts_enable=ld.VOICE_TTS_ENABLE,
-            say_voice=ld.VOICE_SAY_VOICE,
+            tts_enable=bool(_tts0["tts_enable"]),
+            say_voice=str(_tts0["say_voice"]),
+            say_rate_wpm=_tts0["say_rate_wpm"],
             stt_task_fn=self._on_voice_transcript,
         )
         # Do NOT start hotkey listener; this UI drives start/stop recording.
@@ -199,6 +201,46 @@ class LokiWebUI:
 
         @self.app.route("/api/health", methods=["GET"])
         def api_health():
+            return jsonify({"ok": True})
+
+        @self.app.route("/api/tts/voices", methods=["GET"])
+        def api_tts_voices():
+            voices = ld.list_macos_say_voices()
+            return jsonify({"ok": True, "voices": voices, "platform": sys.platform})
+
+        @self.app.route("/api/tts/settings", methods=["GET"])
+        def api_tts_settings_get():
+            if self.voice_mgr is None:
+                return jsonify({"ok": False, "error": "no voice manager"}), 400
+            snap = self.voice_mgr.tts_settings_snapshot()
+            return jsonify({"ok": True, **snap, "settings_path": str(ld.TTS_SETTINGS_PATH)})
+
+        @self.app.route("/api/tts/settings", methods=["POST"])
+        def api_tts_settings_post():
+            if self.voice_mgr is None:
+                return jsonify({"ok": False, "error": "no voice manager"}), 400
+            data = request.get_json(force=True) or {}
+            snap = self.voice_mgr.update_tts_settings(
+                say_voice=data.get("say_voice"),
+                say_rate_wpm=data.get("say_rate_wpm"),
+                tts_enable=data.get("tts_enable"),
+            )
+            try:
+                ld.save_tts_settings_file(snap)
+            except Exception as e:
+                return jsonify({"ok": False, "error": f"save failed: {e}", "applied": snap}), 500
+            return jsonify({"ok": True, **snap})
+
+        @self.app.route("/api/tts/test", methods=["POST"])
+        def api_tts_test():
+            if self.voice_mgr is None:
+                return jsonify({"ok": False, "error": "no voice manager"}), 400
+            data = request.get_json(force=True) or {}
+            phrase = (data.get("text") or "Hello — I'm Loki. This is how I sound with your current voice settings.").strip()
+            try:
+                self.voice_mgr.speak(phrase)
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
             return jsonify({"ok": True})
 
     def _html_page(self) -> str:
