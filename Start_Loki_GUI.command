@@ -5,7 +5,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
 URL="${LOKI_WEB_URL:-http://127.0.0.1:7865}"
-LOG="/tmp/loki_direct_webui_$$.log"
+# Stable path so you can always: tail -f /tmp/loki_direct_webui.log
+LOG="/tmp/loki_direct_webui.log"
 PIDFILE="/tmp/loki_direct_webui.pid"
 
 PYTHON_BIN="python3"
@@ -63,12 +64,23 @@ fi
 
 export LOKI_WEB_HOST="$HOST"
 export LOKI_WEB_PORT="$PORT"
+export PYTHONUNBUFFERED=1
 
-"$PYTHON_BIN" loki_direct_webui.py >"$LOG" 2>&1 &
+# Fresh log for this run (Flask + [webui]/[tts] lines appear here in real time).
+{
+  echo "===== Loki Web UI log $(date) ====="
+  echo "[webui] Using python: $PYTHON_BIN"
+  echo "[webui] Listen: $URL"
+} >"$LOG"
+
+# nohup + stdin detached: keeps server alive when this Terminal tab closes.
+# -u / PYTHONUNBUFFERED: log lines appear immediately (not stuck in buffer).
+nohup env PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u loki_direct_webui.py >>"$LOG" 2>&1 </dev/null &
 PID=$!
 echo "$PID" > "$PIDFILE"
 
-echo "[webui] PID: $PID"
+echo "[webui] PID: $PID (saved in $PIDFILE)"
+echo "[webui] Log file: $LOG"
 
 # Wait until the server is reachable.
 for i in $(seq 1 20); do
@@ -87,6 +99,9 @@ if command -v open >/dev/null 2>&1; then
   open "$URL" || true
 fi
 
-echo "[webui] Server started. Following logs:"
-tail -n 30 "$LOG" || true
-
+echo ""
+echo "[webui] Server is running in the background."
+echo "[webui] This window will STREAM THE LOG below (you should see each click as HTTP lines)."
+echo "[webui] Press Ctrl+C to stop watching — the server keeps running until you: kill $PID"
+echo ""
+tail -f "$LOG"

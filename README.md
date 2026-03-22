@@ -195,7 +195,12 @@ Loki tries xAI embeddings, but will fall back to local hashing embeddings if you
 - **`LOKI_PIPER_DATA_DIR`**: folder where downloaded Piper voices live (default `memories/piper_voices`)
 - **`LOKI_PIPER_BINARY`**: legacy `piper` CLI path when using a raw `.onnx` file (default `piper`)
 - **`LOKI_PIPER_MODEL`**: optional explicit `.onnx` path (overrides voice id when set and file exists)
-- **`LOKI_PIPER_LENGTH_SCALE`**: speech length scale for `.onnx` CLI mode (default `1.0`)
+- **`LOKI_PIPER_LENGTH_SCALE`**: Piper **pace** / phoneme length (default `1.0`; also used for `python -m piper`)
+- **`LOKI_PIPER_NOISE_SCALE`**: Piper **expression** / generator noise (default `0.667`)
+- **`LOKI_PIPER_NOISE_W_SCALE`**: Piper **clarity** / phoneme width noise (default `0.8`)
+- **`LOKI_PIPER_VOLUME`**: Piper output volume multiplier (default `1.0`)
+- **`LOKI_PIPER_SENTENCE_SILENCE`**: seconds of silence after each sentence (default `0`)
+- **`LOKI_PIPER_PLAYBACK_RATE`**: macOS **afplay** speed after synthesis (default `1.0`)
 - **`LOKI_PIPER_SPEAKER`**: optional speaker id (integer) for multi-speaker models
 - **`LOKI_PIPER_MODEL_DIR`**: optional folder for `GET /api/tts/piper_onnx_models` when browsing models in the UI
 
@@ -228,7 +233,7 @@ Open **“Voice & speech (how Loki sounds)”** on the chat page:
 - **Speak replies** — turn spoken answers on/off (independent of “Voice On” for the mic).
 - **TTS engine** — **macOS say** or **Piper** (local neural).
 - **macOS say**: **Voice** — every voice macOS exposes via `say -v ?` (try **Daniel**, **Tom**, **Fred** for US English male; **Samantha** / **Karen** for female; **Premium** voices need **System Settings → Siri & Spotlight → Siri Voice** downloads). **Speaking rate (WPM)** — slightly **slower** (e.g. 150–175) often sounds more natural than the default.
-- **Piper**: set **data dir**, click **Scan folder for voices**, then pick a voice (**radio buttons** for each `*.onnx` found). Use **Custom** to type a voice id or full path to a **`.onnx`** file. Optional legacy **binary** / length scale / speaker id.
+- **Piper**: **tap a voice card** (refreshes from your voice folder), tune **Sound** sliders (pace, expression, clarity, volume, pauses, playback speed), or use **Advanced** for folder path / downloads. Settings auto-save shortly after you change them.
 - **Save** writes **`memories/tts_settings.json`** so CLI and web share the same profile.
 
 **`.env` (defaults before first save)**  
@@ -239,6 +244,7 @@ Open **“Voice & speech (how Loki sounds)”** on the chat page:
 
 **Piper setup (recommended path: Python package)**  
 1. In your venv: `pip install piper-tts` (or `pip install -r requirements-piper.txt`).  
+   If the log shows **`No module named pathvalidate`**, run: `./venv/bin/pip install pathvalidate` (included in `requirements-piper.txt`).  
 2. **See every voice you can install:** `./venv/bin/python -m piper.download_voices` (prints ids like `en_US-lessac-medium`, `en_GB-alan-medium`, …).  
 3. **Download** into your Loki data folder (same path you’ll set in the UI), e.g.  
    `./venv/bin/python -m piper.download_voices --data-dir memories/piper_voices en_US-lessac-medium`  

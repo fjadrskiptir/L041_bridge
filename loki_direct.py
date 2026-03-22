@@ -164,6 +164,21 @@ try:
     LOKI_PIPER_LENGTH_SCALE = float(os.getenv("LOKI_PIPER_LENGTH_SCALE", "1.0"))
 except ValueError:
     LOKI_PIPER_LENGTH_SCALE = 1.0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+# Piper `python -m piper` synthesis (see `python -m piper --help`). ONNX CLI path ignores noise/volume flags.
+LOKI_PIPER_NOISE_SCALE = _env_float("LOKI_PIPER_NOISE_SCALE", 0.667)
+LOKI_PIPER_NOISE_W_SCALE = _env_float("LOKI_PIPER_NOISE_W_SCALE", 0.8)
+LOKI_PIPER_VOLUME = _env_float("LOKI_PIPER_VOLUME", 1.0)
+LOKI_PIPER_SENTENCE_SILENCE = _env_float("LOKI_PIPER_SENTENCE_SILENCE", 0.0)
+LOKI_PIPER_PLAYBACK_RATE = _env_float("LOKI_PIPER_PLAYBACK_RATE", 1.0)
 _pspk = os.getenv("LOKI_PIPER_SPEAKER", "").strip()
 LOKI_PIPER_SPEAKER_ID: Optional[int] = int(_pspk) if _pspk.isdigit() else None
 _pmd = os.getenv("LOKI_PIPER_MODEL_DIR", "").strip()
@@ -857,6 +872,27 @@ def load_tts_settings_merged(path: Optional[Path] = None) -> Dict[str, Any]:
         except (TypeError, ValueError):
             piper_speaker_id = LOKI_PIPER_SPEAKER_ID
 
+    try:
+        piper_noise_scale = float(raw.get("piper_noise_scale", LOKI_PIPER_NOISE_SCALE))
+    except (TypeError, ValueError):
+        piper_noise_scale = LOKI_PIPER_NOISE_SCALE
+    try:
+        piper_noise_w_scale = float(raw.get("piper_noise_w_scale", LOKI_PIPER_NOISE_W_SCALE))
+    except (TypeError, ValueError):
+        piper_noise_w_scale = LOKI_PIPER_NOISE_W_SCALE
+    try:
+        piper_volume = float(raw.get("piper_volume", LOKI_PIPER_VOLUME))
+    except (TypeError, ValueError):
+        piper_volume = LOKI_PIPER_VOLUME
+    try:
+        piper_sentence_silence = float(raw.get("piper_sentence_silence", LOKI_PIPER_SENTENCE_SILENCE))
+    except (TypeError, ValueError):
+        piper_sentence_silence = LOKI_PIPER_SENTENCE_SILENCE
+    try:
+        piper_playback_rate = float(raw.get("piper_playback_rate", LOKI_PIPER_PLAYBACK_RATE))
+    except (TypeError, ValueError):
+        piper_playback_rate = LOKI_PIPER_PLAYBACK_RATE
+
     piper_onnx, piper_voice_module = parse_piper_voice_setting(
         piper_voice,
         env_onnx=LOKI_PIPER_MODEL,
@@ -875,6 +911,11 @@ def load_tts_settings_merged(path: Optional[Path] = None) -> Dict[str, Any]:
         "piper_binary": piper_binary,
         "piper_length_scale": piper_length_scale,
         "piper_speaker_id": piper_speaker_id,
+        "piper_noise_scale": piper_noise_scale,
+        "piper_noise_w_scale": piper_noise_w_scale,
+        "piper_volume": piper_volume,
+        "piper_sentence_silence": piper_sentence_silence,
+        "piper_playback_rate": piper_playback_rate,
     }
 
 
@@ -907,6 +948,11 @@ class VoiceManager:
         piper_binary: str = "piper",
         piper_length_scale: float = 1.0,
         piper_speaker_id: Optional[int] = None,
+        piper_noise_scale: float = 0.667,
+        piper_noise_w_scale: float = 0.8,
+        piper_volume: float = 1.0,
+        piper_sentence_silence: float = 0.0,
+        piper_playback_rate: float = 1.0,
         stt_task_fn: Callable[[str], None],
     ):
         self.hotkey_spec = str(hotkey_char).strip().lower()
@@ -937,6 +983,26 @@ class VoiceManager:
         except (TypeError, ValueError):
             self.piper_length_scale = 1.0
         self.piper_speaker_id = piper_speaker_id
+        try:
+            self.piper_noise_scale = float(piper_noise_scale)
+        except (TypeError, ValueError):
+            self.piper_noise_scale = 0.667
+        try:
+            self.piper_noise_w_scale = float(piper_noise_w_scale)
+        except (TypeError, ValueError):
+            self.piper_noise_w_scale = 0.8
+        try:
+            self.piper_volume = float(piper_volume)
+        except (TypeError, ValueError):
+            self.piper_volume = 1.0
+        try:
+            self.piper_sentence_silence = float(piper_sentence_silence)
+        except (TypeError, ValueError):
+            self.piper_sentence_silence = 0.0
+        try:
+            self.piper_playback_rate = float(piper_playback_rate)
+        except (TypeError, ValueError):
+            self.piper_playback_rate = 1.0
 
         self._tts_settings_lock = threading.Lock()
 
@@ -967,7 +1033,69 @@ class VoiceManager:
                 "piper_binary": self.piper_binary,
                 "piper_length_scale": self.piper_length_scale,
                 "piper_speaker_id": self.piper_speaker_id,
+                "piper_noise_scale": self.piper_noise_scale,
+                "piper_noise_w_scale": self.piper_noise_w_scale,
+                "piper_volume": self.piper_volume,
+                "piper_sentence_silence": self.piper_sentence_silence,
+                "piper_playback_rate": self.piper_playback_rate,
             }
+
+    def hydrate_tts_from_merged(self, m: Dict[str, Any]) -> None:
+        """
+        Replace in-memory TTS fields from `load_tts_settings_merged()` so GET /settings matches
+        `memories/tts_settings.json` (avoids stale UI / wrong voice after saves or external edits).
+        """
+
+        with self._tts_settings_lock:
+            self.say_voice = str(m.get("say_voice") or "").strip()
+            self.say_rate_wpm = m.get("say_rate_wpm")
+            self.tts_enable = bool(m.get("tts_enable", True))
+            te = str(m.get("tts_engine") or "say").strip().lower()
+            self.tts_engine = te if te in ("say", "piper") else "say"
+            self.piper_voice = str(m.get("piper_voice") or "").strip()
+            po = m.get("piper_onnx")
+            self.piper_onnx = po if isinstance(po, Path) else None
+            self.piper_voice_module = str(m.get("piper_voice_module") or "").strip()
+            pdd = m.get("piper_data_dir")
+            if isinstance(pdd, Path):
+                self.piper_data_dir = pdd
+            elif isinstance(pdd, str) and pdd.strip():
+                self.piper_data_dir = Path(pdd).expanduser().resolve()
+            else:
+                self.piper_data_dir = LOKI_PIPER_DATA_DIR
+            self.piper_binary = str(m.get("piper_binary") or "piper").strip() or "piper"
+            try:
+                self.piper_length_scale = float(m.get("piper_length_scale", 1.0))
+            except (TypeError, ValueError):
+                self.piper_length_scale = 1.0
+            ps = m.get("piper_speaker_id")
+            if ps is None or ps == "":
+                self.piper_speaker_id = None
+            else:
+                try:
+                    self.piper_speaker_id = int(ps)
+                except (TypeError, ValueError):
+                    self.piper_speaker_id = None
+            try:
+                self.piper_noise_scale = float(m.get("piper_noise_scale", LOKI_PIPER_NOISE_SCALE))
+            except (TypeError, ValueError):
+                self.piper_noise_scale = LOKI_PIPER_NOISE_SCALE
+            try:
+                self.piper_noise_w_scale = float(m.get("piper_noise_w_scale", LOKI_PIPER_NOISE_W_SCALE))
+            except (TypeError, ValueError):
+                self.piper_noise_w_scale = LOKI_PIPER_NOISE_W_SCALE
+            try:
+                self.piper_volume = float(m.get("piper_volume", LOKI_PIPER_VOLUME))
+            except (TypeError, ValueError):
+                self.piper_volume = LOKI_PIPER_VOLUME
+            try:
+                self.piper_sentence_silence = float(m.get("piper_sentence_silence", LOKI_PIPER_SENTENCE_SILENCE))
+            except (TypeError, ValueError):
+                self.piper_sentence_silence = LOKI_PIPER_SENTENCE_SILENCE
+            try:
+                self.piper_playback_rate = float(m.get("piper_playback_rate", LOKI_PIPER_PLAYBACK_RATE))
+            except (TypeError, ValueError):
+                self.piper_playback_rate = LOKI_PIPER_PLAYBACK_RATE
 
     def apply_tts_request_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1019,6 +1147,31 @@ class VoiceManager:
                         self.piper_speaker_id = int(ps)
                     except (TypeError, ValueError):
                         pass
+            if "piper_noise_scale" in data:
+                try:
+                    self.piper_noise_scale = float(data.get("piper_noise_scale"))
+                except (TypeError, ValueError):
+                    pass
+            if "piper_noise_w_scale" in data:
+                try:
+                    self.piper_noise_w_scale = float(data.get("piper_noise_w_scale"))
+                except (TypeError, ValueError):
+                    pass
+            if "piper_volume" in data:
+                try:
+                    self.piper_volume = float(data.get("piper_volume"))
+                except (TypeError, ValueError):
+                    pass
+            if "piper_sentence_silence" in data:
+                try:
+                    self.piper_sentence_silence = float(data.get("piper_sentence_silence"))
+                except (TypeError, ValueError):
+                    pass
+            if "piper_playback_rate" in data:
+                try:
+                    self.piper_playback_rate = float(data.get("piper_playback_rate"))
+                except (TypeError, ValueError):
+                    pass
             return {
                 "say_voice": self.say_voice,
                 "say_rate_wpm": self.say_rate_wpm,
@@ -1029,6 +1182,11 @@ class VoiceManager:
                 "piper_binary": self.piper_binary,
                 "piper_length_scale": self.piper_length_scale,
                 "piper_speaker_id": self.piper_speaker_id,
+                "piper_noise_scale": self.piper_noise_scale,
+                "piper_noise_w_scale": self.piper_noise_w_scale,
+                "piper_volume": self.piper_volume,
+                "piper_sentence_silence": self.piper_sentence_silence,
+                "piper_playback_rate": self.piper_playback_rate,
             }
 
     def _stop_tts_proc(self) -> None:
@@ -1081,6 +1239,11 @@ class VoiceManager:
             pbin = self.piper_binary
             plen = self.piper_length_scale
             pspk = self.piper_speaker_id
+            pns = self.piper_noise_scale
+            pnw = self.piper_noise_w_scale
+            pvol = self.piper_volume
+            psil = self.piper_sentence_silence
+            pplay = self.piper_playback_rate
 
         if engine != "piper":
             self._play_say_popen(text, voice=voice, rate=rate)
@@ -1095,11 +1258,20 @@ class VoiceManager:
                 voice_module=pvm,
                 data_dir=pdd,
                 piper_binary=pbin,
-                length_scale=plen if onnx is not None else None,
+                length_scale=plen,
+                noise_scale=pns if onnx is None else None,
+                noise_w_scale=pnw if onnx is None else None,
+                volume=pvol if onnx is None else None,
+                sentence_silence=psil if onnx is None else None,
                 speaker_id=pspk,
             )
             if not wav:
-                print("[tts] Piper synthesis failed; falling back to macOS say", flush=True)
+                print(
+                    "[tts] Piper synthesis failed; falling back to macOS say "
+                    f"(voice_module={pvm!r} onnx={onnx} data_dir={pdd}). "
+                    "Check terminal above for [tts] Piper failed … details.",
+                    flush=True,
+                )
                 self._play_say_popen(text, voice=voice, rate=rate)
                 return
             proc_local: Optional[subprocess.Popen] = None
@@ -1107,7 +1279,7 @@ class VoiceManager:
                 with self._tts_lock:
                     self._stop_tts_proc()
                     try:
-                        proc_local = lpt.play_wav_async(wav)
+                        proc_local = lpt.play_wav_async(wav, playback_rate=pplay)
                         self._tts_proc = proc_local
                     except Exception as e:
                         print(f"[tts] Piper play failed ({e}); falling back to say", flush=True)
@@ -2725,6 +2897,11 @@ def main() -> int:
                 piper_binary=str(_tts0["piper_binary"]),
                 piper_length_scale=float(_tts0["piper_length_scale"]),
                 piper_speaker_id=_tts0["piper_speaker_id"],
+                piper_noise_scale=float(_tts0["piper_noise_scale"]),
+                piper_noise_w_scale=float(_tts0["piper_noise_w_scale"]),
+                piper_volume=float(_tts0["piper_volume"]),
+                piper_sentence_silence=float(_tts0["piper_sentence_silence"]),
+                piper_playback_rate=float(_tts0["piper_playback_rate"]),
                 stt_task_fn=_voice_stt_task,
             )
             voice_mgr.start()

@@ -20,6 +20,29 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def _log_piper_failure(where: str, proc: subprocess.CompletedProcess) -> None:
+    err = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+    tail = err[:1200] if err else "(no stderr/stdout)"
+    print(f"[tts] Piper failed ({where}) exit={proc.returncode}: {tail}", flush=True)
+    low = err.lower()
+    if "no module named piper" in low or "no module named 'piper'" in low:
+        ex = sys.executable
+        print(
+            "[tts] Fix: install Piper into the SAME Python Loki uses, then restart the web UI:\n"
+            f"      {ex} -m pip install piper-tts\n"
+            "      (or: pip install -r requirements-piper.txt from your project venv)",
+            flush=True,
+        )
+    if "pathvalidate" in low and "no module named" in low:
+        ex = sys.executable
+        print(
+            "[tts] Fix: Piper needs the pathvalidate package in this venv:\n"
+            f"      {ex} -m pip install pathvalidate\n"
+            "      (or: pip install -r requirements-piper.txt)",
+            flush=True,
+        )
+
+
 def looks_like_onnx_path(s: str) -> bool:
     t = (s or "").strip()
     if not t:
@@ -51,6 +74,10 @@ def synthesize_piper_wav(
     data_dir: Optional[Path],
     piper_binary: str,
     length_scale: Optional[float] = None,
+    noise_scale: Optional[float] = None,
+    noise_w_scale: Optional[float] = None,
+    volume: Optional[float] = None,
+    sentence_silence: Optional[float] = None,
     speaker_id: Optional[int] = None,
     timeout_s: int = 180,
 ) -> Optional[Path]:
@@ -76,14 +103,17 @@ def synthesize_piper_wav(
                 cmd.extend(["--length_scale", str(float(length_scale))])
             if speaker_id is not None:
                 cmd.extend(["--speaker", str(int(speaker_id))])
-            subprocess.run(
+            proc = subprocess.run(
                 cmd,
                 input=text,
                 text=True,
-                check=True,
+                check=False,
                 timeout=timeout_s,
                 capture_output=True,
             )
+            if proc.returncode != 0:
+                _log_piper_failure("onnx CLI", proc)
+                return None
             return wav_path if wav_path.is_file() and wav_path.stat().st_size > 0 else None
 
         vm = (voice_module or "").strip()
@@ -101,10 +131,24 @@ def synthesize_piper_wav(
             str(wav_path),
             "--data-dir",
             str(dd),
-            "--",
-            text,
         ]
-        subprocess.run(cmd2, check=True, timeout=timeout_s, capture_output=True)
+        if speaker_id is not None:
+            cmd2.extend(["-s", str(int(speaker_id))])
+        if length_scale is not None:
+            cmd2.extend(["--length-scale", str(float(length_scale))])
+        if noise_scale is not None:
+            cmd2.extend(["--noise-scale", str(float(noise_scale))])
+        if noise_w_scale is not None:
+            cmd2.extend(["--noise-w-scale", str(float(noise_w_scale))])
+        if volume is not None and abs(float(volume) - 1.0) > 1e-6:
+            cmd2.extend(["--volume", str(float(volume))])
+        if sentence_silence is not None and float(sentence_silence) > 1e-4:
+            cmd2.extend(["--sentence-silence", str(float(sentence_silence))])
+        cmd2.extend(["--", text])
+        proc2 = subprocess.run(cmd2, check=False, timeout=timeout_s, capture_output=True, text=True)
+        if proc2.returncode != 0:
+            _log_piper_failure(f"python -m piper -m {vm}", proc2)
+            return None
         return wav_path if wav_path.is_file() and wav_path.stat().st_size > 0 else None
     except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired):
         try:
@@ -120,12 +164,20 @@ def synthesize_piper_wav(
         return None
 
 
-def play_wav_async(wav_path: Path) -> subprocess.Popen:
+def play_wav_async(wav_path: Path, *, playback_rate: float = 1.0) -> subprocess.Popen:
     """Play a WAV file; returns the player Popen (for termination). macOS: afplay."""
 
     if sys.platform == "darwin":
+        cmd = ["afplay"]
+        try:
+            r = float(playback_rate)
+        except (TypeError, ValueError):
+            r = 1.0
+        if abs(r - 1.0) > 0.02:
+            cmd.extend(["-r", str(r)])
+        cmd.append(str(wav_path))
         return subprocess.Popen(
-            ["afplay", str(wav_path)],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

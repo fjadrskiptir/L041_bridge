@@ -157,6 +157,11 @@ class LokiGUI(tk.Tk):
             piper_binary=str(_tts0["piper_binary"]),
             piper_length_scale=float(_tts0["piper_length_scale"]),
             piper_speaker_id=_tts0["piper_speaker_id"],
+            piper_noise_scale=float(_tts0["piper_noise_scale"]),
+            piper_noise_w_scale=float(_tts0["piper_noise_w_scale"]),
+            piper_volume=float(_tts0["piper_volume"]),
+            piper_sentence_silence=float(_tts0["piper_sentence_silence"]),
+            piper_playback_rate=float(_tts0["piper_playback_rate"]),
             stt_task_fn=lambda transcript: self._dispatch_voice_transcript(transcript),
         )
 

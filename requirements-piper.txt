@@ -1,2 +1,4 @@
 # Optional: local neural TTS (see README "Piper setup")
 piper-tts
+# Piper's CLI imports this; some pip installs omit it — install explicitly if you see ModuleNotFoundError: pathvalidate
+pathvalidate>=3.2.0
