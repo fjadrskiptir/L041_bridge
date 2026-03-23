@@ -115,6 +115,12 @@ COMPILED_MEMORY_PATH = Path(os.getenv("LOKI_COMPILED_MEMORY_PATH", str(MEMORY_DI
 INBOX_DIR = Path(os.getenv("LOKI_INBOX_DIR", str(MEMORY_DIR / "inbox"))).resolve()
 PROCESSED_DIR = Path(os.getenv("LOKI_PROCESSED_DIR", str(MEMORY_DIR / "processed"))).resolve()
 SCREEN_CONFIG_PATH = Path(os.getenv("LOKI_SCREEN_CONFIG_PATH", str(MEMORY_DIR / "screen_indices.json"))).resolve()
+# Personality / behavior / voice-in-text (markdown). Kept under memories/ but excluded from generic memory rglob.
+PERSONA_DIR = Path(os.getenv("LOKI_PERSONA_DIR", str(MEMORY_DIR / "persona"))).resolve()
+PERSONA_INSTRUCTIONS_PATH = Path(
+    os.getenv("LOKI_PERSONA_INSTRUCTIONS_PATH", str(PERSONA_DIR / "instructions.md"))
+).resolve()
+PERSONA_INSTRUCTIONS_MAX_CHARS = int(os.getenv("LOKI_PERSONA_INSTRUCTIONS_MAX_CHARS", "48000"))
 
 REQUEST_TIMEOUT_S = float(os.getenv("LOKI_HTTP_TIMEOUT_S", "60"))
 RETRIEVAL_K = int(os.getenv("LOKI_RETRIEVAL_K", "6"))
@@ -231,6 +237,16 @@ def safe_read_text(path: Path, max_chars: int = 80_000) -> str:
     return data
 
 
+def _memory_path_is_under_persona_tree(memory_root: Path, path: Path) -> bool:
+    """`memories/persona/` is reserved for personality instructions (injected separately into system prompt)."""
+
+    try:
+        rel = path.resolve().relative_to(memory_root.resolve())
+    except ValueError:
+        return False
+    return len(rel.parts) > 0 and rel.parts[0] == "persona"
+
+
 def load_memories(folder: Path) -> Tuple[str, List[str]]:
     if not folder.exists():
         return "", []
@@ -239,8 +255,24 @@ def load_memories(folder: Path) -> Tuple[str, List[str]]:
 
     text_exts = {".txt", ".md", ".markdown", ".json", ".yaml", ".yml"}
     image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-    text_files = sorted([p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in text_exts])
-    image_files = sorted([p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in image_exts])
+    text_files = sorted(
+        [
+            p
+            for p in folder.rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in text_exts
+            and not _memory_path_is_under_persona_tree(folder, p)
+        ]
+    )
+    image_files = sorted(
+        [
+            p
+            for p in folder.rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in image_exts
+            and not _memory_path_is_under_persona_tree(folder, p)
+        ]
+    )
     if not text_files and not image_files:
         return "", []
 
@@ -257,6 +289,64 @@ def load_memories(folder: Path) -> Tuple[str, List[str]]:
             f"{manifest}"
         )
     return "\n\n".join(chunks), []
+
+
+PERSONA_DEFAULT_TEMPLATE = """# Loki — personality & instructions
+
+Edit this file to steer how Loki **writes**, **behaves**, and **speaks in text** (tone, cadence, boundaries). This block is injected into the **system prompt** on every reply—not vector search.
+
+## Voice & tone
+- (e.g. warm, direct, playful, formal…)
+
+## Cadence & format
+- (e.g. short paragraphs, occasional lists, when to use markdown…)
+
+## Boundaries & safety
+- (e.g. topics to avoid, how to decline, confirm risky actions…)
+
+## Relationship to the user
+- (e.g. how they want to be addressed, inside jokes to respect…)
+
+## Anything else
+- Free-form notes.
+
+---
+After saving, run **`/mem`** in chat (or use **Reload memories** in the web UI) so the running session picks up changes.
+"""
+
+
+def ensure_persona_template() -> None:
+    """Create `memories/persona/` and a starter `instructions.md` if missing."""
+
+    try:
+        PERSONA_DIR.mkdir(parents=True, exist_ok=True)
+        if not PERSONA_INSTRUCTIONS_PATH.exists():
+            PERSONA_INSTRUCTIONS_PATH.write_text(PERSONA_DEFAULT_TEMPLATE, encoding="utf-8")
+    except OSError as e:
+        print(f"[persona] Could not create template ({e})", flush=True)
+
+
+def load_persona_instructions() -> str:
+    """Raw markdown for the personality / custom-instructions block."""
+
+    try:
+        if not PERSONA_INSTRUCTIONS_PATH.is_file():
+            return ""
+        return safe_read_text(PERSONA_INSTRUCTIONS_PATH, max_chars=PERSONA_INSTRUCTIONS_MAX_CHARS)
+    except OSError:
+        return ""
+
+
+def save_persona_instructions(content: str) -> None:
+    """Write persona markdown (UTF-8). Caller should reload system prompt afterward."""
+
+    PERSONA_DIR.mkdir(parents=True, exist_ok=True)
+    text = content if isinstance(content, str) else str(content)
+    if len(text) > PERSONA_INSTRUCTIONS_MAX_CHARS:
+        raise ValueError(
+            f"Persona instructions too long ({len(text)} chars); max {PERSONA_INSTRUCTIONS_MAX_CHARS}"
+        )
+    PERSONA_INSTRUCTIONS_PATH.write_text(text, encoding="utf-8")
 
 
 def guess_mime(path: Path) -> str:
@@ -2264,7 +2354,7 @@ def refresh_system_time_message(messages: List[Dict[str, Any]], static_base: str
 
 
 def build_base_system_static(memory_text: str) -> str:
-    """Core system instructions + snapshot memory (no clock block — clock is added per request)."""
+    """Core system instructions + persona + snapshot memory (no clock block — clock is added per request)."""
 
     base = (
         "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
@@ -2280,6 +2370,15 @@ def build_base_system_static(memory_text: str) -> str:
             f"If the user does not name a calendar, prefer `{LOKI_APPLE_CALENDAR_DEFAULT}` (override via LOKI_APPLE_CALENDAR_DEFAULT). "
             "Always confirm before deleting events.\n"
         )
+
+    persona = load_persona_instructions().strip()
+    if persona:
+        base += (
+            "\n\n### Personality & custom instructions (authoritative — follow unless the user overrides in this chat)\n"
+            + persona
+            + "\n"
+        )
+
     if memory_text:
         base += "\nUser memory (treat as true unless contradicted):\n" + memory_text
     return base
@@ -2682,7 +2781,8 @@ def print_banner() -> None:
     print("Loki Direct ready.")
     print("Enter messages normally. Commands:")
     print("  /help")
-    print("  /mem (reload memories)")
+    print("  /mem (reload memories + persona into system prompt)")
+    print(f"  /persona (show path to personality file: {PERSONA_INSTRUCTIONS_PATH})")
     print("  /attach <path> (attach a text/image file for analysis)")
     print("  /ingest <path> (add file/folder into vector memory)")
     print("  /compile_mem (write compiled memory document)")
@@ -2721,6 +2821,9 @@ def main() -> int:
     screen_indices = load_screen_indices()
     if screen is not None:
         print(f"[screen] Using indices: left={screen_indices['left']} right={screen_indices['right']}")
+
+    ensure_persona_template()
+    print(f"[persona] Instructions file: {PERSONA_INSTRUCTIONS_PATH}")
 
     # Memory
     memory_text, memory_warnings = load_memories(MEMORY_DIR)
@@ -3030,6 +3133,14 @@ def main() -> int:
             print(butt.scan())
             continue
 
+        if user_in == "/persona":
+            ensure_persona_template()
+            pt = load_persona_instructions()
+            print(f"[persona] File: {PERSONA_INSTRUCTIONS_PATH}")
+            print(f"[persona] Loaded length: {len(pt)} characters (max {PERSONA_INSTRUCTIONS_MAX_CHARS})")
+            print("[persona] Run /mem after editing on disk to refresh the system prompt.")
+            continue
+
         if user_in == "/mem":
             memory_text, memory_warnings = load_memories(MEMORY_DIR)
             if memory_warnings:
@@ -3038,7 +3149,7 @@ def main() -> int:
             base_system_static = build_base_system_static(memory_text)
             tail = [m for m in messages if m.get("role") != "system"]
             messages = [{"role": "system", "content": compose_system_with_time(base_system_static)}] + tail
-            print(f"[memory] Reloaded {MEMORY_DIR}")
+            print(f"[memory] Reloaded {MEMORY_DIR} (includes persona from {PERSONA_INSTRUCTIONS_PATH.name})")
             continue
 
         if user_in.startswith("/ingest "):

@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 import os
 import re
+import subprocess
 import sys
 
 from flask import Flask, jsonify, request
@@ -35,7 +36,7 @@ _port_raw = str(_port_raw).strip()
 _port_match = re.search(r"([0-9]+)", _port_raw)
 APP_PORT = int(_port_match.group(1)) if _port_match else 7865
 APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
-WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-22.piper-noise-ui")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-23.persona-panel")
 
 # JSON keys accepted for POST /api/tts/settings and POST /api/tts/test (apply before preview).
 _TTS_REQUEST_KEYS = (
@@ -75,6 +76,7 @@ class LokiWebUI:
         except Exception:
             self.screen = None
 
+        ld.ensure_persona_template()
         self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
 
         self.tools = ld.build_core_tools(self.butt, self.screen)
@@ -237,6 +239,50 @@ class LokiWebUI:
 
         @self.app.route("/api/health", methods=["GET"])
         def api_health():
+            return jsonify({"ok": True})
+
+        @self.app.route("/api/persona", methods=["GET"])
+        def api_persona_get():
+            ld.ensure_persona_template()
+            return jsonify(
+                {
+                    "ok": True,
+                    "path": str(ld.PERSONA_INSTRUCTIONS_PATH),
+                    "max_chars": ld.PERSONA_INSTRUCTIONS_MAX_CHARS,
+                    "content": ld.load_persona_instructions(),
+                }
+            )
+
+        @self.app.route("/api/persona", methods=["POST"])
+        def api_persona_post():
+            data = request.get_json(force=True) or {}
+            content = data.get("content")
+            if not isinstance(content, str):
+                return jsonify({"ok": False, "error": "content must be a string"}), 400
+            try:
+                ld.save_persona_instructions(content)
+            except ValueError as e:
+                return jsonify({"ok": False, "error": str(e)}), 400
+            except OSError as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+            with self.chat_lock:
+                self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
+                ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
+            print("[webui] POST /api/persona saved + refreshed system prompt", flush=True)
+            return jsonify({"ok": True, "path": str(ld.PERSONA_INSTRUCTIONS_PATH), "len": len(content)})
+
+        @self.app.route("/api/persona/reveal", methods=["POST"])
+        def api_persona_reveal():
+            if sys.platform != "darwin":
+                return jsonify({"ok": False, "error": "Reveal in Finder is only available on macOS"}), 400
+            ld.ensure_persona_template()
+            p = ld.PERSONA_INSTRUCTIONS_PATH
+            if not p.is_file():
+                return jsonify({"ok": False, "error": "Persona file not found"}), 400
+            try:
+                subprocess.Popen(["open", "-R", str(p)])
+            except OSError as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
             return jsonify({"ok": True})
 
         @self.app.route("/api/tts/voices", methods=["GET"])

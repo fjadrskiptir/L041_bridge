@@ -199,7 +199,7 @@ Loki tries xAI embeddings, but will fall back to local hashing embeddings if you
 - **`LOKI_PIPER_NOISE_SCALE`**: Piper **expression** / generator noise (default `0.667`; UI/server clamp roughly **0.18–1.2**)
 - **`LOKI_PIPER_NOISE_W_SCALE`**: Piper **clarity** / phoneme width noise (default `0.8`; clamp roughly **0.3–1.4**)
 - **`LOKI_PIPER_VOLUME`**: Piper output volume multiplier (default `1.0`)
-- **`LOKI_PIPER_SENTENCE_SILENCE`**: seconds of silence after each sentence (default `0`)
+- **`LOKI_PIPER_SENTENCE_SILENCE`**: seconds of silence after each sentence (default `0`). Piper’s CLI used to insert an **odd** gap in bytes for many values (e.g. 0.05 s at 22.05 kHz), which **misaligned 16‑bit PCM** and caused **loud static after the first sentence**. Loki now **nudges** the value slightly so the gap is always an even number of bytes.
 - **`LOKI_PIPER_PLAYBACK_RATE`**: macOS **afplay** speed after synthesis (default `1.0`)
 - **`LOKI_PIPER_SPEAKER`**: optional speaker id (integer) for multi-speaker models
 - **`LOKI_PIPER_MODEL_DIR`**: optional folder for `GET /api/tts/piper_onnx_models` when browsing models in the UI

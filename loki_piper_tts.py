@@ -12,6 +12,8 @@ Two invocation styles:
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
 import sys
@@ -53,6 +55,51 @@ def looks_like_onnx_path(s: str) -> bool:
         return Path(t).suffix.lower() == ".onnx"
     except Exception:
         return False
+
+
+def _piper_sample_rate_hz(
+    onnx_path: Optional[Path],
+    data_dir: Path,
+    voice_module: str,
+) -> int:
+    """Read output sample rate from the voice's ONNX JSON (Piper voice config)."""
+
+    candidates: List[Path] = []
+    if onnx_path is not None and onnx_path.is_file():
+        candidates.append(Path(str(onnx_path) + ".json"))
+    vm = (voice_module or "").strip()
+    if vm:
+        candidates.append(data_dir / f"{vm}.onnx.json")
+    for p in candidates:
+        try:
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+            sr = cfg.get("audio", {}).get("sample_rate")
+            if isinstance(sr, int) and sr > 0:
+                return int(sr)
+        except Exception:
+            continue
+    return 22050
+
+
+def _pcm16_aligned_sentence_silence(sentence_silence: float, sample_rate: int) -> float:
+    """
+    Piper inserts int(sample_rate * silence * 2) zero *bytes* between sentences.
+    For 16-bit mono PCM each frame is 2 bytes — an odd byte count shifts all
+    following samples by one byte → loud static after the first sentence.
+    """
+
+    s = float(sentence_silence)
+    if s <= 1e-9:
+        return s
+    sr = int(sample_rate)
+    if sr <= 0:
+        sr = 22050
+    nbytes = int(sr * s * 2)
+    if nbytes < 0:
+        nbytes = 0
+    if nbytes % 2 == 1:
+        nbytes += 1
+    return nbytes / (2.0 * float(sr))
 
 
 def resolve_piper_binary(binary: str) -> str:
@@ -132,7 +179,20 @@ def synthesize_piper_wav(
         if volume is not None:
             cmd2.extend(["--volume", str(float(volume))])
         if sentence_silence is not None and float(sentence_silence) > 1e-5:
-            cmd2.extend(["--sentence-silence", str(float(sentence_silence))])
+            sr = _piper_sample_rate_hz(
+                onnx_path if (onnx_path and onnx_path.is_file()) else None,
+                dd,
+                (voice_module or "").strip(),
+            )
+            raw_s = float(sentence_silence)
+            aligned = _pcm16_aligned_sentence_silence(raw_s, sr)
+            if os.getenv("LOKI_DEBUG_TTS", "").strip().lower() in {"1", "true", "yes", "on"} and abs(aligned - raw_s) > 1e-7:
+                print(
+                    f"[tts] Piper sentence_silence {raw_s} → {aligned} s "
+                    f"(16-bit PCM gap alignment, sr={sr} Hz)",
+                    flush=True,
+                )
+            cmd2.extend(["--sentence-silence", str(float(aligned))])
         cmd2.extend(["--", text])
         proc2 = subprocess.run(cmd2, check=False, timeout=timeout_s, capture_output=True, text=True)
         if proc2.returncode != 0:
@@ -163,7 +223,8 @@ def play_wav_async(wav_path: Path, *, playback_rate: float = 1.0) -> subprocess.
         except (TypeError, ValueError):
             r = 1.0
         if abs(r - 1.0) > 0.02:
-            cmd.extend(["-r", str(r)])
+            # Default rate quality is 0 (low); higher quality avoids artifacts when using -r.
+            cmd.extend(["-q", "1", "-r", str(r)])
         cmd.append(str(wav_path))
         return subprocess.Popen(
             cmd,
