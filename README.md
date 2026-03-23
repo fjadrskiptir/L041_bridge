@@ -2,6 +2,9 @@
 
 Run a local “Grok companion” that can:
 - **Chat via xAI** (Grok) with tool-calling.
+- **Web search** (DuckDuckGo via `web_search` tool — optional `duckduckgo-search` package).
+- **Webcam (Web UI)**: capture a frame from your browser camera and send it with your message (xAI vision); not continuous video.
+- **Telegram (Web UI)**: optional two-way chat + a few spontaneous “thinking of you” messages per day (your Mac stays the brain; phone works on cellular).
 - **Control your desktop** (mouse/keyboard + screenshots) via `pyautogui`.
 - **Control Intiface / Buttplug toys** (e.g., Lovense Nora) via `ws://127.0.0.1:12345`.
 - **Ingest text/images/PDFs into persistent memory** (SQLite vector store).
@@ -24,8 +27,10 @@ This repo is evolving toward a fully local AI companion loop: perception (screen
 ### Install deps (venv)
 
 ```bash
-./venv/bin/python -m pip install -U requests python-dotenv pyautogui buttplug pypdf
+./venv/bin/python -m pip install -U requests python-dotenv pyautogui buttplug pypdf duckduckgo-search
 ```
+
+(`duckduckgo-search` powers the **`web_search`** tool for research; Loki runs without it but will tell you to install if you ask him to search.)
 
 ### Configure xAI key
 
@@ -47,7 +52,7 @@ python3 loki_direct.py
 
 `loki_direct.py` will attempt to use the repo `venv` automatically when run with `python3`.
 
-- **Web UI (macOS)**: double-click `Start_Loki_GUI.command` to open a basic browser UI with buttons (including Hold-to-Talk).
+- **Web UI (macOS)**: double-click `Start_Loki_GUI.command` to open a basic browser UI with buttons (including Hold-to-Talk and **Camera on / Send with camera**).
   - After starting, open: `http://127.0.0.1:7865`
 
 Voice in the web UI is button-driven (press-and-hold) and uses your microphone + macOS `say` for speech.
@@ -181,6 +186,36 @@ Loki tries xAI embeddings, but will fall back to local hashing embeddings if you
 - **`XAI_EMBEDDING_MODEL`**: default `grok-embedding` (may not be available)
 - **`XAI_EMBEDDINGS_ENDPOINT`**: default `https://api.x.ai/v1/embeddings`
 - **`LOKI_RETRIEVAL_K`**: default `6`
+
+### Web search
+- **`LOKI_WEB_SEARCH`**: `1` (on) / `0` — enable tool `web_search` (DuckDuckGo).
+- **`LOKI_WEB_SEARCH_MAX_RESULTS`**: default `8` (hard cap 15 per call).
+
+### Webcam (Web UI only)
+Uses **getUserMedia** in the browser (works on **localhost** or HTTPS). Each click of **Send with camera** uploads **one JPEG frame** to Loki; the server runs **xAI vision** (same path as `/attach` images), then Grok replies. Nothing is streamed continuously.
+- **`LOKI_WEBCAM_MAX_MB`**: max decoded image size per frame (default `6`).
+
+### Telegram (Web UI — long polling)
+Your **phone talks to Telegram’s servers**; **`loki_direct_webui.py` on your Mac** long-polls Telegram and runs the **same Loki session** as the browser (shared `messages`, tools, memory). You can open the notification and **reply in the Telegram chat** on LTE/5G — no home Wi‑Fi required on the phone. **The Mac must be on** and the Web UI process running.
+
+1. Message **@BotFather** → `/newbot` → copy the **bot token**.
+2. Start your bot in Telegram, send any message, then visit  
+   `https://api.telegram.org/bot<TOKEN>/getUpdates`  
+   and read **`message.chat.id`** — that’s your **user id** (for DMs).
+3. In `.env`:
+   - **`LOKI_TELEGRAM=1`**
+   - **`TELEGRAM_BOT_TOKEN=...`**
+   - **`TELEGRAM_ALLOWED_CHAT_IDS=123456789`** (comma-separated if several)
+
+**Proactive pings** (warm check-ins, capped per local day, grounded in **`cross_chat_log.jsonl`** when enabled):
+
+- **`LOKI_TELEGRAM_PROACTIVE_PER_DAY`**: default `3` (`0` = inbound only).
+- **`LOKI_TELEGRAM_PROACTIVE_MIN_INTERVAL_S`** / **`LOKI_TELEGRAM_PROACTIVE_MAX_INTERVAL_S`**: random spacing between pings (defaults ~1h–4h).
+- **`LOKI_TELEGRAM_QUOTA_TZ`**: IANA timezone for the daily reset (e.g. `America/Los_Angeles`). If unset, uses the machine’s local calendar date.
+- **`LOKI_TELEGRAM_QUOTA_PATH`**: override path for the quota JSON (default `memories/telegram_proactive_quota.json`).
+- **`LOKI_TELEGRAM_PROACTIVE_INSTRUCTIONS_PATH`**: optional file; otherwise **`memories/telegram_proactive_instructions.md`** is read if present. See `memories/telegram_proactive_instructions.example.md`.
+
+**Privacy:** only chat ids in **`TELEGRAM_ALLOWED_CHAT_IDS`** get replies. Inbound Telegram turns do **not** trigger Mac TTS (so your speaker doesn’t read every phone message aloud).
 
 ### Memory + DB paths
 - **`LOKI_MEMORY_DIR`**: default `memories`

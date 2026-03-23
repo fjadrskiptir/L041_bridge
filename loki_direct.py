@@ -132,6 +132,10 @@ LOKI_BRAVE_LEO_INJECT_SYNC = os.getenv("LOKI_BRAVE_LEO_INJECT_SYNC", "1").strip(
 # If set, Brave Leo must send Authorization: Bearer <this> to POST /v1/chat/completions (same value in Brave "API Key").
 LOKI_LEO_BRIDGE_API_KEY = os.getenv("LOKI_LEO_BRIDGE_API_KEY", "").strip()
 
+# Web search (DuckDuckGo via duckduckgo-search package — no API key).
+LOKI_WEB_SEARCH_ENABLED = os.getenv("LOKI_WEB_SEARCH", "1").strip() not in {"0", "false", "False", "no", "NO"}
+LOKI_WEB_SEARCH_MAX_RESULTS = int(os.getenv("LOKI_WEB_SEARCH_MAX_RESULTS", "8"))
+
 _cross_chat_lock = threading.Lock()
 
 REQUEST_TIMEOUT_S = float(os.getenv("LOKI_HTTP_TIMEOUT_S", "60"))
@@ -139,6 +143,10 @@ RETRIEVAL_K = int(os.getenv("LOKI_RETRIEVAL_K", "6"))
 WATCH_MEMORY_FOLDER = os.getenv("LOKI_WATCH_MEMORY_FOLDER", "1").strip() not in {"0", "false", "False", "no", "NO"}
 WATCH_POLL_S = float(os.getenv("LOKI_WATCH_POLL_S", "2.0"))
 LOKI_MAX_SCREENSHOT_IMAGES = int(os.getenv("LOKI_MAX_SCREENSHOT_IMAGES", "4"))
+try:
+    LOKI_WEBCAM_MAX_DECODED_BYTES = max(400_000, int(float(os.getenv("LOKI_WEBCAM_MAX_MB", "6")) * 1024 * 1024))
+except ValueError:
+    LOKI_WEBCAM_MAX_DECODED_BYTES = 6 * 1024 * 1024
 
 # Authoritative clock in system prompt (epoch + ISO) — helps models reason about real dates/timelines.
 LOKI_TIME_SYSTEM_PROMPT = os.getenv("LOKI_TIME_SYSTEM_PROMPT", "1").strip() not in {"0", "false", "False", "no", "NO"}
@@ -414,9 +422,10 @@ def append_cross_chat_log(source: str, user_text: str, assistant_text: str) -> N
         print(f"[cross_chat] append failed: {e}", flush=True)
 
 
-def load_cross_chat_for_system_prompt() -> str:
-    """Recent turns (newest-first packing) for system prompt — keep under CROSS_CHAT_PROMPT_MAX_CHARS."""
+def load_cross_chat_for_system_prompt(max_chars: Optional[int] = None) -> str:
+    """Recent turns (newest-first packing) for system prompt — keep under max_chars (default: CROSS_CHAT_PROMPT_MAX_CHARS)."""
 
+    limit = int(max_chars) if max_chars is not None else int(CROSS_CHAT_PROMPT_MAX_CHARS)
     if not CROSS_CHAT_LOG_ENABLED:
         return ""
     p = CROSS_CHAT_LOG_PATH
@@ -441,7 +450,7 @@ def load_cross_chat_for_system_prompt() -> str:
         if not u and not a:
             continue
         piece = f"- **{ts}** `[{src}]`\n  **User:** {u}\n  **Assistant:** {a}\n"
-        if total + len(piece) > CROSS_CHAT_PROMPT_MAX_CHARS:
+        if total + len(piece) > limit:
             break
         chunks.append(piece)
         total += len(piece)
@@ -484,6 +493,67 @@ def tool_update_persona_instructions(content: str, mode: str = "replace") -> Dic
         "mode": mode_n,
         "session_refreshed": bool(refresh.get("ok")),
         "session_refresh_detail": refresh,
+    }
+
+
+def tool_web_search(query: str, max_results: Optional[int] = None) -> Dict[str, Any]:
+    """
+    DuckDuckGo text search for research / current topics.
+    Requires: pip install duckduckgo-search
+    """
+
+    if not LOKI_WEB_SEARCH_ENABLED:
+        return {"ok": False, "error": "Web search disabled (set LOKI_WEB_SEARCH=0)."}
+
+    try:
+        from duckduckgo_search import DDGS  # type: ignore[import-untyped]
+    except ImportError:
+        return {
+            "ok": False,
+            "error": "Install web search: ./venv/bin/pip install duckduckgo-search",
+        }
+
+    q = (query or "").strip()
+    if not q:
+        return {"ok": False, "error": "query is empty"}
+
+    try:
+        mr_in = max_results if max_results is not None else LOKI_WEB_SEARCH_MAX_RESULTS
+        mr = int(mr_in)
+    except (TypeError, ValueError):
+        mr = LOKI_WEB_SEARCH_MAX_RESULTS
+    mr = max(1, min(mr, 15))
+
+    try:
+        rows: List[Dict[str, str]] = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(q, max_results=mr):
+                if not isinstance(r, dict):
+                    continue
+                title = str(r.get("title") or "").strip()
+                href = str(r.get("href") or r.get("url") or "").strip()
+                body = str(r.get("body") or "").strip()
+                if not title and not href and not body:
+                    continue
+                rows.append(
+                    {
+                        "title": title[:500],
+                        "url": href[:2000],
+                        "snippet": body[:2500],
+                    }
+                )
+                if len(rows) >= mr:
+                    break
+    except Exception as e:
+        return {"ok": False, "error": f"Search failed: {e}", "query": q}
+
+    print(f"[web_search] query={q!r} results={len(rows)}", flush=True)
+    return {
+        "ok": True,
+        "query": q,
+        "result_count": len(rows),
+        "results": rows,
+        "note": "Summarize and cite URLs for the user; snippets may be incomplete.",
     }
 
 
@@ -1905,13 +1975,20 @@ class XAIClient:
         self.model = model
         self.timeout_s = timeout_s
 
-    def chat(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.3,
-            "max_tokens": 900,
+            "temperature": 0.3 if temperature is None else float(temperature),
+            "max_tokens": 900 if max_tokens is None else int(max_tokens),
         }
         if tools:
             payload["tools"] = tools
@@ -1987,6 +2064,31 @@ def analyze_images_with_xai_responses(
     if resp.status_code != 200:
         return f"[image analysis failed {resp.status_code}] {resp.text[:500]}"
     return extract_responses_text(resp.json()) or "[image analysis returned no text]"
+
+
+def validate_image_data_url(data_url: str, *, max_decoded_bytes: Optional[int] = None) -> str:
+    """
+    Validate browser/webcam uploads: data:image/<mime>;base64,...
+    Raises ValueError on bad input or oversize payload.
+    """
+    limit = int(max_decoded_bytes or LOKI_WEBCAM_MAX_DECODED_BYTES)
+    s = (data_url or "").strip()
+    if not s.startswith("data:image/"):
+        raise ValueError("Image must be a data URL starting with data:image/")
+    if "base64," not in s:
+        raise ValueError("Only base64 data URLs are supported")
+    head, _, b64_rest = s.partition("base64,")
+    b64 = re.sub(r"\s+", "", b64_rest)
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception as e:
+        raise ValueError(f"Invalid base64 image: {e}") from e
+    if len(raw) < 64:
+        raise ValueError("Image payload too small")
+    if len(raw) > limit:
+        mb = max(1, limit // (1024 * 1024))
+        raise ValueError(f"Image too large (max ~{mb}MB decoded). Lower JPEG quality or raise LOKI_WEBCAM_MAX_MB.")
+    return f"{head}base64,{b64}"
 
 
 def extract_image_data_urls(tool_result: str) -> List[str]:
@@ -2501,7 +2603,11 @@ def build_base_system_static(memory_text: str) -> str:
         "If the user asks to change your long-term personality, writing style, or behavioral rules, use tools "
         "`read_persona_instructions` and `update_persona_instructions` (prefer mode `append` for small additions; "
         "`replace` only with the full new markdown after reading the current file if needed).\n"
+        "When the user is learning something, asks for current facts, or wants research beyond your training cutoff, "
+        "call `web_search` (DuckDuckGo; install `duckduckgo-search` if missing) and synthesize answers with citations.\n"
         "For visual understanding of the desktop, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
+        "In the **Web UI**, the user can send a **webcam frame** from their browser; you receive a vision-model summary "
+        "of that frame together with their message—use it as ground truth for what the camera saw.\n"
         "You receive an authoritative **clock block** (Unix epoch + ISO timestamps) on every model call—use it for real-world dates and timelines; "
         "when in doubt call `get_current_time`.\n"
     )
@@ -2589,6 +2695,31 @@ def build_core_tools(butt: ButtplugController, screen: Optional[ScreenController
                 "additionalProperties": False,
             },
             fn=tool_update_persona_instructions,
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="web_search",
+            description=(
+                "Search the public web via DuckDuckGo (no API key). Use for research, learning topics, recent events, "
+                "or anything that needs up-to-date sources. Returns titles, URLs, and short snippets — summarize for the user and cite links."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query (be specific for technical topics)."},
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 15,
+                        "description": "Number of results (default from LOKI_WEB_SEARCH_MAX_RESULTS, max 15).",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            fn=tool_web_search,
         )
     )
 

@@ -29,6 +29,7 @@ import sys
 from flask import Flask, jsonify, request
 
 import loki_direct as ld
+from loki_telegram import maybe_start_telegram
 
 
 _port_raw = os.environ.get("LOKI_WEB_PORT", "7865")
@@ -36,7 +37,7 @@ _port_raw = str(_port_raw).strip()
 _port_match = re.search(r"([0-9]+)", _port_raw)
 APP_PORT = int(_port_match.group(1)) if _port_match else 7865
 APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
-WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-23.brave-leo-bridge")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-18.webcam")
 
 # JSON keys accepted for POST /api/tts/settings and POST /api/tts/test (apply before preview).
 _TTS_REQUEST_KEYS = (
@@ -139,6 +140,10 @@ class LokiWebUI:
         ld.set_persona_session_refresh_hook(_persona_session_refresh_web)
 
         self._register_routes()
+        try:
+            maybe_start_telegram(self)
+        except Exception as e:
+            print(f"[telegram] start failed: {e}", flush=True)
         print(
             f"[webui] version={WEBUI_VERSION} starting at http://{APP_HOST}:{APP_PORT} "
             f"(Brave Leo OpenAI bridge: http://{APP_HOST}:{APP_PORT}/v1)",
@@ -180,16 +185,27 @@ class LokiWebUI:
         def api_send():
             data = request.get_json(force=True) or {}
             text = (data.get("text") or "").strip()
-            if not text:
-                return jsonify({"ok": False, "error": "empty text"}), 400
+            image = data.get("image")
+            if isinstance(image, str):
+                image = image.strip() or None
+            else:
+                image = None
+            if not text and not image:
+                return jsonify({"ok": False, "error": "need message text and/or a webcam image"}), 400
             # User line is shown immediately in the browser; do not also enqueue it (poll would duplicate).
             # Synchronous chat is simplest for reliability.
             try:
-                assistant = self.handle_text(text, from_voice=False, blocking=True)
+                if image:
+                    assistant = self.handle_webcam_send(text, image)
+                else:
+                    assistant = self.handle_text(text, from_voice=False, blocking=True)
+            except ValueError as e:
+                return jsonify({"ok": False, "error": str(e)}), 400
             except Exception as e:
                 assistant = f"[error] {e}"
             if ld.CROSS_CHAT_APPEND_HOME:
-                ld.append_cross_chat_log("loki_direct_webui", text, assistant)
+                log_user = f"{text} 📷" if (text and image) else (text or "📷 [webcam]")
+                ld.append_cross_chat_log("loki_direct_webui", log_user, assistant)
             self._enqueue_event("assistant", assistant)
             return jsonify({"ok": True, "assistant": assistant})
 
@@ -468,6 +484,11 @@ class LokiWebUI:
     .piper-advanced summary {{ cursor: pointer; color: #444; margin-top: 12px; }}
     #piperDownloadHelp summary {{ cursor: pointer; color: #444; }}
     #piperUseCustomBtn {{ font-size: 13px; padding: 6px 12px; }}
+    #webcamRow {{ margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }}
+    #webcamPreviewWrap {{ border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: #111; min-height: 120px; display: none; }}
+    #webcamPreviewWrap.on {{ display: block; }}
+    #webcamVideo {{ display: block; max-width: 320px; max-height: 240px; width: auto; height: auto; }}
+    #webcamHint {{ flex: 1; min-width: 200px; margin: 0; }}
   </style>
 </head>
 <body>
@@ -478,6 +499,18 @@ class LokiWebUI:
   <div id="controls">
     <input id="text" type="text" placeholder="Type a message (try: /tools, /attach <path>)"/>
     <button id="send">Send</button>
+  </div>
+
+  <div id="webcamRow">
+    <div>
+      <button type="button" id="webcamStart">Camera on</button>
+      <button type="button" id="webcamStop" disabled>Camera off</button>
+      <button type="button" id="webcamSend" disabled>Send with camera</button>
+    </div>
+    <div id="webcamPreviewWrap">
+      <video id="webcamVideo" playsinline muted autoplay></video>
+    </div>
+    <p class="small" id="webcamHint">Uses your browser camera (HTTPS or localhost). Turn the camera on, then send a frame with your question. Nothing streams continuously—only the frame you send goes to the server.</p>
   </div>
 
   <div id="voiceRow">
@@ -627,9 +660,94 @@ class LokiWebUI:
   const status = document.getElementById('status');
   const input = document.getElementById('text');
   const sendBtn = document.getElementById('send');
+  const webcamStart = document.getElementById('webcamStart');
+  const webcamStop = document.getElementById('webcamStop');
+  const webcamSend = document.getElementById('webcamSend');
+  const webcamVideo = document.getElementById('webcamVideo');
+  const webcamWrap = document.getElementById('webcamPreviewWrap');
+  const webcamHint = document.getElementById('webcamHint');
   const voiceToggle = document.getElementById('voiceToggle');
   const holdBtn = document.getElementById('hold');
   const stopBtn = document.getElementById('stop');
+
+  function captureWebcamJpegDataUrl() {{
+    if (!webcamVideo || !webcamVideo.srcObject) return null;
+    const w = webcamVideo.videoWidth, h = webcamVideo.videoHeight;
+    if (!w || !h) return null;
+    const maxW = 1280;
+    let tw = w, th = h;
+    if (w > maxW) {{
+      tw = maxW;
+      th = Math.round(h * (maxW / w));
+    }}
+    const c = document.createElement('canvas');
+    c.width = tw;
+    c.height = th;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(webcamVideo, 0, 0, tw, th);
+    return c.toDataURL('image/jpeg', 0.85);
+  }}
+
+  if (webcamStart) {{
+    webcamStart.onclick = async () => {{
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
+        if (webcamHint) webcamHint.textContent = 'This browser does not expose getUserMedia.';
+        return;
+      }}
+      try {{
+        const stream = await navigator.mediaDevices.getUserMedia({{ video: {{ facingMode: 'user' }}, audio: false }});
+        webcamVideo.srcObject = stream;
+        webcamWrap.classList.add('on');
+        webcamStart.disabled = true;
+        webcamStop.disabled = false;
+        webcamSend.disabled = false;
+        if (webcamHint) webcamHint.textContent = 'Preview on. Type a question (optional) and click Send with camera.';
+      }} catch (e) {{
+        if (webcamHint) webcamHint.textContent = 'Camera error: ' + ((e && e.message) ? e.message : e);
+      }}
+    }};
+  }}
+  if (webcamStop) {{
+    webcamStop.onclick = () => {{
+      const stream = webcamVideo && webcamVideo.srcObject;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      webcamVideo.srcObject = null;
+      webcamWrap.classList.remove('on');
+      webcamStart.disabled = false;
+      webcamStop.disabled = true;
+      webcamSend.disabled = true;
+      if (webcamHint) webcamHint.textContent = 'Camera off. Uses your browser camera (HTTPS or localhost). Only the frame you send goes to the server.';
+    }};
+  }}
+  if (webcamSend) {{
+    webcamSend.onclick = async () => {{
+      const dataUrl = captureWebcamJpegDataUrl();
+      if (!dataUrl) {{
+        add('system', 'Camera not ready — turn Camera on and wait for the preview.');
+        return;
+      }}
+      if (sendInFlight) return;
+      const text = input.value.trim();
+      sendInFlight = true;
+      add('user', text ? (text + ' \\uD83D\\uDCF7') : '\\uD83D\\uDCF7 [webcam frame]');
+      if (text) input.value = '';
+      status.textContent = 'Thinking...';
+      try {{
+        const r = await fetch('/api/send', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{ text, image: dataUrl }})
+        }});
+        const d = await r.json().catch(() => ({{}}));
+        if (!r.ok) {{
+          add('system', (d && d.error) ? d.error : ('Send failed: ' + r.status));
+        }}
+      }} finally {{
+        sendInFlight = false;
+        status.textContent = 'Idle';
+      }}
+    }};
+  }}
 
   function add(role, text) {{
     const div = document.createElement('div');
@@ -687,11 +805,15 @@ class LokiWebUI:
     input.value = '';
     status.textContent = 'Thinking...';
     try {{
-      await fetch('/api/send', {{
+      const r = await fetch('/api/send', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify({{text}})
       }});
+      const d = await r.json().catch(() => ({{}}));
+      if (!r.ok) {{
+        add('system', (d && d.error) ? d.error : ('Send failed: ' + r.status));
+      }}
     }} finally {{
       sendInFlight = false;
       status.textContent = 'Idle';
@@ -1226,15 +1348,71 @@ class LokiWebUI:
 </body>
 </html>"""
 
-    def handle_text(self, user_in: str, from_voice: bool, blocking: bool = True) -> str:
+    def handle_webcam_send(self, user_text: str, image_data_url: str) -> str:
+        """Analyze one browser webcam frame (data URL) + optional user message, then run chat turn."""
+
         with self.chat_lock:
             self._busy = True
             try:
-                return self._handle_text_locked(user_in)
+                return self._handle_webcam_send_locked(user_text, image_data_url)
             finally:
                 self._busy = False
 
-    def _handle_text_locked(self, user_in: str) -> str:
+    def _handle_webcam_send_locked(self, user_text: str, image_data_url: str) -> str:
+        url = ld.validate_image_data_url(image_data_url)
+        ut = (user_text or "").strip()
+        if ut:
+            vision_prompt = (
+                f"The user says:\n{ut}\n\n"
+                "Describe what you see in this camera frame in detail. Answer their question directly if they asked one. "
+                "Note any readable text, objects, people (generally), lighting, and background."
+            )
+        else:
+            vision_prompt = (
+                "Describe what you see in this camera frame in detail: objects, readable text, people (generally), "
+                "lighting, and background."
+            )
+        analysis = ld.analyze_images_with_xai_responses(
+            ld.XAI_API_KEY,
+            [url],
+            vision_prompt,
+            max_output_tokens=520,
+        )
+
+        r_query = ut if ut else "webcam camera view scene description"
+        retrieved_block = ""
+        try:
+            qemb = ld.embed_texts(self.xai, [r_query])[0]
+            hits = self.vstore.search(qemb, k=ld.RETRIEVAL_K)
+            if hits:
+                parts = []
+                for h in hits:
+                    parts.append(f"- score={h['score']:.3f} source={h['source_path']} chunk={h['chunk_index']}\n{h['text']}")
+                retrieved_block = "Retrieved memory:\n" + "\n\n".join(parts)
+        except Exception:
+            retrieved_block = ""
+
+        if ut:
+            core = f"{ut}\n\n---\n[Webcam frame — vision summary]\n{analysis}"
+        else:
+            core = f"[Webcam frame — user sent video only]\n\n[Vision summary]\n{analysis}"
+
+        if retrieved_block:
+            self.messages.append({"role": "user", "content": f"{core}\n\n---\n{retrieved_block}"})
+        else:
+            self.messages.append({"role": "user", "content": core})
+
+        return self._run_model_turn(skip_tts=False)
+
+    def handle_text(self, user_in: str, from_voice: bool, blocking: bool = True, *, skip_tts: bool = False) -> str:
+        with self.chat_lock:
+            self._busy = True
+            try:
+                return self._handle_text_locked(user_in, skip_tts=skip_tts)
+            finally:
+                self._busy = False
+
+    def _handle_text_locked(self, user_in: str, *, skip_tts: bool = False) -> str:
         autop = ld.looks_like_existing_path(user_in)
         if autop:
             user_in = f"/attach {autop}"
@@ -1243,7 +1421,8 @@ class LokiWebUI:
             return (
                 "Commands: /tools, /scan, /mem, /persona, /attach <path>, /ingest <path>, /compile_mem, "
                 "/set_screen left <i>, /autodetect_screens, /upgrade <req> — time: get_current_time; "
-                "macOS Calendar: apple_calendar_* tools"
+                "macOS Calendar: apple_calendar_* tools. Web UI: **Camera on** + **Send with camera** for webcam. "
+                "Telegram: same session if LOKI_TELEGRAM=1."
             )
 
         if user_in == "/tools":
@@ -1319,7 +1498,7 @@ class LokiWebUI:
                     }
                 )
 
-            return self._run_model_turn()
+            return self._run_model_turn(skip_tts=skip_tts)
 
         if user_in == "/compile_mem":
             self.vstore.export_compiled_markdown(ld.COMPILED_MEMORY_PATH)
@@ -1364,9 +1543,9 @@ class LokiWebUI:
         else:
             self.messages.append({"role": "user", "content": user_in})
 
-        return self._run_model_turn()
+        return self._run_model_turn(skip_tts=skip_tts)
 
-    def _run_model_turn(self) -> str:
+    def _run_model_turn(self, *, skip_tts: bool = False) -> str:
         ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
         resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
         msg = ld.extract_assistant_message(resp)
@@ -1433,8 +1612,8 @@ class LokiWebUI:
 
         self.messages.append({"role": "assistant", "content": content})
 
-        # TTS only when Voice On is enabled (checkbox syncs /api/voice/toggle).
-        if self.voice_enabled and self.voice_mgr:
+        # TTS only when Voice On is enabled (checkbox syncs /api/voice/toggle). Telegram skips TTS.
+        if not skip_tts and self.voice_enabled and self.voice_mgr:
             try:
                 self.voice_mgr.speak(str(content))
             except Exception:
