@@ -464,6 +464,9 @@ Enable permissions for the app you’re running Loki from (Terminal/Cursor):
 ### Embeddings model not available
 If xAI embeddings return 404/permission errors, Loki uses a **local embedding fallback** for retrieval.
 
+### Git: commits, GitHub Desktop, cloning ComfyUI next to this repo
+See **[docs/GIT_PRIMER.md](docs/GIT_PRIMER.md)** (uncommitted vs staged vs untracked, `.gitignore`, push/pull, and how to clone another repo **outside** this folder).
+
 ---
 
 ## Roadmap ideas

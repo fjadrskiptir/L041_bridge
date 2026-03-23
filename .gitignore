@@ -9,3 +9,22 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Local vector DB (default path; override LOKI_VECTOR_DB_PATH if yours differs)
+loki_memory.sqlite3
+*.sqlite3-journal
+
+# Runtime / personal memory state (keep persona templates tracked under memories/persona/)
+memories/inbox/
+memories/processed/
+memories/piper_voices/
+memories/compiled_memory.md
+memories/cross_chat_log.jsonl
+memories/screen_indices.json
+memories/telegram_poll_offset.txt
+memories/telegram_proactive_quota.json
+memories/tts_settings.json
+memories/watch_test.txt
+
+# Optional: scratch plugin (remove this line if you want it in the repo)
+loki_plugins/now.py
