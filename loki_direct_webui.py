@@ -35,7 +35,7 @@ _port_raw = str(_port_raw).strip()
 _port_match = re.search(r"([0-9]+)", _port_raw)
 APP_PORT = int(_port_match.group(1)) if _port_match else 7865
 APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
-WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-22.tts-voice-cards")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-22.piper-noise-ui")
 
 # JSON keys accepted for POST /api/tts/settings and POST /api/tts/test (apply before preview).
 _TTS_REQUEST_KEYS = (
@@ -452,7 +452,7 @@ class LokiWebUI:
       </div>
 
       <div class="piper-subhead">Sound (Piper neural voice)</div>
-      <p class="small" style="margin:-4px 0 8px 0">These map to Piper’s engine. Playback speed uses macOS <code>afplay</code> after the voice is generated.</p>
+      <p class="small" style="margin:-4px 0 8px 0">These map to Piper’s <code>--noise-scale</code> / <code>--noise-w-scale</code> (more subtle than <b>Pace</b>; compare slider min vs max). Playback speed uses macOS <code>afplay</code> after the voice is generated.</p>
       <div class="piper-slider-row">
         <label>Pace <span class="small" style="font-weight:normal;color:#666">(speaking rate — lower = faster)</span></label>
         <input type="range" id="ttsPiperPace" min="0.55" max="1.45" step="0.05" value="1"/>
@@ -460,12 +460,12 @@ class LokiWebUI:
       </div>
       <div class="piper-slider-row">
         <label>Expression <span class="small" style="font-weight:normal;color:#666">(voice variation / warmth)</span></label>
-        <input type="range" id="ttsPiperExpression" min="0.35" max="1" step="0.025" value="0.667"/>
+        <input type="range" id="ttsPiperExpression" min="0.18" max="1.2" step="0.02" value="0.667"/>
         <span class="piper-slider-val" id="ttsPiperExpressionVal">0.667</span>
       </div>
       <div class="piper-slider-row">
         <label>Clarity <span class="small" style="font-weight:normal;color:#666">(phoneme definition)</span></label>
-        <input type="range" id="ttsPiperClarity" min="0.4" max="1.2" step="0.02" value="0.8"/>
+        <input type="range" id="ttsPiperClarity" min="0.3" max="1.4" step="0.02" value="0.8"/>
         <span class="piper-slider-val" id="ttsPiperClarityVal">0.8</span>
       </div>
       <div class="piper-slider-row">
@@ -987,6 +987,12 @@ class LokiWebUI:
     }} catch (e) {{}}
   }}
 
+  function parseSliderFloat(el, defVal) {{
+    if (!el) return defVal;
+    const v = parseFloat(el.value);
+    return Number.isFinite(v) ? v : defVal;
+  }}
+
   function buildTtsPostBody() {{
     let spk = ttsPiperSpeaker.value.trim();
     let spkOut = null;
@@ -994,6 +1000,7 @@ class LokiWebUI:
       const n = parseInt(spk, 10);
       if (!isNaN(n)) spkOut = n;
     }}
+    const pauseRaw = parseSliderFloat(ttsPiperPause, 0.0);
     return {{
       tts_engine: ttsEngine.value,
       say_voice: ttsVoice.value || '',
@@ -1002,12 +1009,12 @@ class LokiWebUI:
       piper_voice: ttsPiperVoice.value.trim(),
       piper_data_dir: ttsPiperDataDir.value.trim(),
       piper_binary: ttsPiperBinary.value.trim(),
-      piper_length_scale: parseFloat(ttsPiperPace.value) || 1.0,
-      piper_noise_scale: parseFloat(ttsPiperExpression.value) || 0.667,
-      piper_noise_w_scale: parseFloat(ttsPiperClarity.value) || 0.8,
-      piper_volume: parseFloat(ttsPiperVol.value) || 1.0,
-      piper_sentence_silence: parseFloat(ttsPiperPause.value) || 0.0,
-      piper_playback_rate: parseFloat(ttsPiperPlaySpeed.value) || 1.0,
+      piper_length_scale: parseSliderFloat(ttsPiperPace, 1.0),
+      piper_noise_scale: parseSliderFloat(ttsPiperExpression, 0.667),
+      piper_noise_w_scale: parseSliderFloat(ttsPiperClarity, 0.8),
+      piper_volume: parseSliderFloat(ttsPiperVol, 1.0),
+      piper_sentence_silence: Number.isFinite(pauseRaw) ? pauseRaw : 0.0,
+      piper_playback_rate: parseSliderFloat(ttsPiperPlaySpeed, 1.0),
       piper_speaker_id: spkOut
     }};
   }}

@@ -96,29 +96,18 @@ def synthesize_piper_wav(
     wav_path = Path(tmp)
 
     try:
+        # Always use `python -m piper` so length / noise / volume / silence flags work.
+        # The legacy `piper` binary path ignored most of those, which made UI sliders ineffective
+        # whenever the voice resolved to a direct .onnx file.
+        model_arg: str
         if onnx_path is not None and onnx_path.is_file():
-            exe = resolve_piper_binary(piper_binary)
-            cmd: List[str] = [exe, "--model", str(onnx_path.resolve()), "--output_file", str(wav_path)]
-            if length_scale is not None and abs(float(length_scale) - 1.0) > 1e-6:
-                cmd.extend(["--length_scale", str(float(length_scale))])
-            if speaker_id is not None:
-                cmd.extend(["--speaker", str(int(speaker_id))])
-            proc = subprocess.run(
-                cmd,
-                input=text,
-                text=True,
-                check=False,
-                timeout=timeout_s,
-                capture_output=True,
-            )
-            if proc.returncode != 0:
-                _log_piper_failure("onnx CLI", proc)
+            model_arg = str(onnx_path.resolve())
+        else:
+            vm = (voice_module or "").strip()
+            if not vm:
                 return None
-            return wav_path if wav_path.is_file() and wav_path.stat().st_size > 0 else None
+            model_arg = vm
 
-        vm = (voice_module or "").strip()
-        if not vm:
-            return None
         dd = (data_dir or Path.cwd()).resolve()
         dd.mkdir(parents=True, exist_ok=True)
         cmd2: List[str] = [
@@ -126,7 +115,7 @@ def synthesize_piper_wav(
             "-m",
             "piper",
             "-m",
-            vm,
+            model_arg,
             "-f",
             str(wav_path),
             "--data-dir",
@@ -140,14 +129,14 @@ def synthesize_piper_wav(
             cmd2.extend(["--noise-scale", str(float(noise_scale))])
         if noise_w_scale is not None:
             cmd2.extend(["--noise-w-scale", str(float(noise_w_scale))])
-        if volume is not None and abs(float(volume) - 1.0) > 1e-6:
+        if volume is not None:
             cmd2.extend(["--volume", str(float(volume))])
-        if sentence_silence is not None and float(sentence_silence) > 1e-4:
+        if sentence_silence is not None and float(sentence_silence) > 1e-5:
             cmd2.extend(["--sentence-silence", str(float(sentence_silence))])
         cmd2.extend(["--", text])
         proc2 = subprocess.run(cmd2, check=False, timeout=timeout_s, capture_output=True, text=True)
         if proc2.returncode != 0:
-            _log_piper_failure(f"python -m piper -m {vm}", proc2)
+            _log_piper_failure(f"python -m piper -m {model_arg}", proc2)
             return None
         return wav_path if wav_path.is_file() and wav_path.stat().st_size > 0 else None
     except (subprocess.CalledProcessError, FileNotFoundError, OSError, subprocess.TimeoutExpired):

@@ -196,13 +196,14 @@ Loki tries xAI embeddings, but will fall back to local hashing embeddings if you
 - **`LOKI_PIPER_BINARY`**: legacy `piper` CLI path when using a raw `.onnx` file (default `piper`)
 - **`LOKI_PIPER_MODEL`**: optional explicit `.onnx` path (overrides voice id when set and file exists)
 - **`LOKI_PIPER_LENGTH_SCALE`**: Piper **pace** / phoneme length (default `1.0`; also used for `python -m piper`)
-- **`LOKI_PIPER_NOISE_SCALE`**: Piper **expression** / generator noise (default `0.667`)
-- **`LOKI_PIPER_NOISE_W_SCALE`**: Piper **clarity** / phoneme width noise (default `0.8`)
+- **`LOKI_PIPER_NOISE_SCALE`**: Piper **expression** / generator noise (default `0.667`; UI/server clamp roughly **0.18–1.2**)
+- **`LOKI_PIPER_NOISE_W_SCALE`**: Piper **clarity** / phoneme width noise (default `0.8`; clamp roughly **0.3–1.4**)
 - **`LOKI_PIPER_VOLUME`**: Piper output volume multiplier (default `1.0`)
 - **`LOKI_PIPER_SENTENCE_SILENCE`**: seconds of silence after each sentence (default `0`)
 - **`LOKI_PIPER_PLAYBACK_RATE`**: macOS **afplay** speed after synthesis (default `1.0`)
 - **`LOKI_PIPER_SPEAKER`**: optional speaker id (integer) for multi-speaker models
 - **`LOKI_PIPER_MODEL_DIR`**: optional folder for `GET /api/tts/piper_onnx_models` when browsing models in the UI
+- **`LOKI_DEBUG_TTS`**: set to `1` / `true` to print Piper preview parameters (pace, noise scales, volume, …) to the terminal
 
 ---
 
@@ -249,9 +250,10 @@ Open **“Voice & speech (how Loki sounds)”** on the chat page:
 3. **Download** into your Loki data folder (same path you’ll set in the UI), e.g.  
    `./venv/bin/python -m piper.download_voices --data-dir memories/piper_voices en_US-lessac-medium`  
    Repeat with another id to add more voices (each creates `<id>.onnx` + `<id>.onnx.json`).  
-4. In the Web UI choose **Piper**, set **Piper data dir**, **Scan folder for voices**, select a voice, **Save**, then **Test voice**.  
-5. **Browse / preview** voices: [Piper samples](https://rhasspy.github.io/piper-samples) · full catalog on [Hugging Face](https://huggingface.co/rhasspy/piper-voices/tree/main).  
-6. Audio plays via **`afplay`** on macOS. If Piper fails (missing install/model), Loki **falls back to `say`** and logs `[tts] Piper synthesis failed`.
+4. In the Web UI choose **Piper**, set **Piper data dir**, **Scan folder for voices**, select a voice, **Save**, then **Test voice**.
+5. Sanity-check noise sliders: `./venv/bin/python smoke_piper_tts.py` (expects different WAV hashes for min vs max expression/clarity).  
+6. **Browse / preview** voices: [Piper samples](https://rhasspy.github.io/piper-samples) · full catalog on [Hugging Face](https://huggingface.co/rhasspy/piper-voices/tree/main).  
+7. Audio plays via **`afplay`** on macOS. If Piper fails (missing install/model), Loki **falls back to `say`** and logs `[tts] Piper synthesis failed`.
 
 **More natural speech (hardware / install)**  
 | Option | Quality | Notes |

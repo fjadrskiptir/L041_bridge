@@ -201,6 +201,26 @@ def clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
+def clamp_piper_noise_scale(x: float) -> float:
+    """Piper generator noise; keep in a range that stays stable but still audibly varies."""
+
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return float(LOKI_PIPER_NOISE_SCALE)
+    return max(0.18, min(1.2, v))
+
+
+def clamp_piper_noise_w_scale(x: float) -> float:
+    """Phoneme-width noise (Piper `--noise-w-scale`)."""
+
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return float(LOKI_PIPER_NOISE_W_SCALE)
+    return max(0.3, min(1.4, v))
+
+
 def safe_read_text(path: Path, max_chars: int = 80_000) -> str:
     try:
         data = path.read_text(encoding="utf-8", errors="replace")
@@ -873,13 +893,15 @@ def load_tts_settings_merged(path: Optional[Path] = None) -> Dict[str, Any]:
             piper_speaker_id = LOKI_PIPER_SPEAKER_ID
 
     try:
-        piper_noise_scale = float(raw.get("piper_noise_scale", LOKI_PIPER_NOISE_SCALE))
+        piper_noise_scale = clamp_piper_noise_scale(float(raw.get("piper_noise_scale", LOKI_PIPER_NOISE_SCALE)))
     except (TypeError, ValueError):
-        piper_noise_scale = LOKI_PIPER_NOISE_SCALE
+        piper_noise_scale = clamp_piper_noise_scale(float(LOKI_PIPER_NOISE_SCALE))
     try:
-        piper_noise_w_scale = float(raw.get("piper_noise_w_scale", LOKI_PIPER_NOISE_W_SCALE))
+        piper_noise_w_scale = clamp_piper_noise_w_scale(
+            float(raw.get("piper_noise_w_scale", LOKI_PIPER_NOISE_W_SCALE))
+        )
     except (TypeError, ValueError):
-        piper_noise_w_scale = LOKI_PIPER_NOISE_W_SCALE
+        piper_noise_w_scale = clamp_piper_noise_w_scale(float(LOKI_PIPER_NOISE_W_SCALE))
     try:
         piper_volume = float(raw.get("piper_volume", LOKI_PIPER_VOLUME))
     except (TypeError, ValueError):
@@ -984,13 +1006,13 @@ class VoiceManager:
             self.piper_length_scale = 1.0
         self.piper_speaker_id = piper_speaker_id
         try:
-            self.piper_noise_scale = float(piper_noise_scale)
+            self.piper_noise_scale = clamp_piper_noise_scale(float(piper_noise_scale))
         except (TypeError, ValueError):
-            self.piper_noise_scale = 0.667
+            self.piper_noise_scale = clamp_piper_noise_scale(0.667)
         try:
-            self.piper_noise_w_scale = float(piper_noise_w_scale)
+            self.piper_noise_w_scale = clamp_piper_noise_w_scale(float(piper_noise_w_scale))
         except (TypeError, ValueError):
-            self.piper_noise_w_scale = 0.8
+            self.piper_noise_w_scale = clamp_piper_noise_w_scale(0.8)
         try:
             self.piper_volume = float(piper_volume)
         except (TypeError, ValueError):
@@ -1018,6 +1040,8 @@ class VoiceManager:
 
         self._tts_proc: Optional[subprocess.Popen] = None
         self._tts_lock = threading.Lock()
+        # One Piper subprocess at a time avoids overlapping synth/play races on rapid "Test voice".
+        self._piper_synthesis_lock = threading.Lock()
 
         self._kb_listener = None
 
@@ -1077,13 +1101,17 @@ class VoiceManager:
                 except (TypeError, ValueError):
                     self.piper_speaker_id = None
             try:
-                self.piper_noise_scale = float(m.get("piper_noise_scale", LOKI_PIPER_NOISE_SCALE))
+                self.piper_noise_scale = clamp_piper_noise_scale(
+                    float(m.get("piper_noise_scale", LOKI_PIPER_NOISE_SCALE))
+                )
             except (TypeError, ValueError):
-                self.piper_noise_scale = LOKI_PIPER_NOISE_SCALE
+                self.piper_noise_scale = clamp_piper_noise_scale(float(LOKI_PIPER_NOISE_SCALE))
             try:
-                self.piper_noise_w_scale = float(m.get("piper_noise_w_scale", LOKI_PIPER_NOISE_W_SCALE))
+                self.piper_noise_w_scale = clamp_piper_noise_w_scale(
+                    float(m.get("piper_noise_w_scale", LOKI_PIPER_NOISE_W_SCALE))
+                )
             except (TypeError, ValueError):
-                self.piper_noise_w_scale = LOKI_PIPER_NOISE_W_SCALE
+                self.piper_noise_w_scale = clamp_piper_noise_w_scale(float(LOKI_PIPER_NOISE_W_SCALE))
             try:
                 self.piper_volume = float(m.get("piper_volume", LOKI_PIPER_VOLUME))
             except (TypeError, ValueError):
@@ -1149,12 +1177,12 @@ class VoiceManager:
                         pass
             if "piper_noise_scale" in data:
                 try:
-                    self.piper_noise_scale = float(data.get("piper_noise_scale"))
+                    self.piper_noise_scale = clamp_piper_noise_scale(float(data.get("piper_noise_scale")))
                 except (TypeError, ValueError):
                     pass
             if "piper_noise_w_scale" in data:
                 try:
-                    self.piper_noise_w_scale = float(data.get("piper_noise_w_scale"))
+                    self.piper_noise_w_scale = clamp_piper_noise_w_scale(float(data.get("piper_noise_w_scale")))
                 except (TypeError, ValueError):
                     pass
             if "piper_volume" in data:
@@ -1252,46 +1280,60 @@ class VoiceManager:
         def worker() -> None:
             import loki_piper_tts as lpt
 
-            wav = lpt.synthesize_piper_wav(
-                text,
-                onnx_path=onnx,
-                voice_module=pvm,
-                data_dir=pdd,
-                piper_binary=pbin,
-                length_scale=plen,
-                noise_scale=pns if onnx is None else None,
-                noise_w_scale=pnw if onnx is None else None,
-                volume=pvol if onnx is None else None,
-                sentence_silence=psil if onnx is None else None,
-                speaker_id=pspk,
-            )
-            if not wav:
+            if os.getenv("LOKI_DEBUG_TTS", "").strip().lower() in {"1", "true", "yes", "on"}:
                 print(
-                    "[tts] Piper synthesis failed; falling back to macOS say "
-                    f"(voice_module={pvm!r} onnx={onnx} data_dir={pdd}). "
-                    "Check terminal above for [tts] Piper failed … details.",
+                    f"[tts] Piper synth preview len={plen!r} noise={pns!r} noise_w={pnw!r} "
+                    f"vol={pvol!r} silence={psil!r} play={pplay!r} speaker={pspk!r}",
                     flush=True,
                 )
-                self._play_say_popen(text, voice=voice, rate=rate)
-                return
+
+            wav: Optional[Path] = None
             proc_local: Optional[subprocess.Popen] = None
             try:
-                with self._tts_lock:
-                    self._stop_tts_proc()
-                    try:
-                        proc_local = lpt.play_wav_async(wav, playback_rate=pplay)
-                        self._tts_proc = proc_local
-                    except Exception as e:
-                        print(f"[tts] Piper play failed ({e}); falling back to say", flush=True)
-                if proc_local is None:
-                    self._play_say_popen(text, voice=voice, rate=rate)
-                else:
-                    proc_local.wait()
+                with self._piper_synthesis_lock:
+                    wav = lpt.synthesize_piper_wav(
+                        text,
+                        onnx_path=onnx,
+                        voice_module=pvm,
+                        data_dir=pdd,
+                        piper_binary=pbin,
+                        length_scale=plen,
+                        noise_scale=pns,
+                        noise_w_scale=pnw,
+                        volume=pvol,
+                        sentence_silence=psil,
+                        speaker_id=pspk,
+                    )
+                    if not wav:
+                        print(
+                            "[tts] Piper synthesis failed; falling back to macOS say "
+                            f"(voice_module={pvm!r} onnx={onnx} data_dir={pdd}). "
+                            "Check terminal above for [tts] Piper failed … details.",
+                            flush=True,
+                        )
+                        self._play_say_popen(text, voice=voice, rate=rate)
+                        return
+                    with self._tts_lock:
+                        self._stop_tts_proc()
+                        try:
+                            proc_local = lpt.play_wav_async(wav, playback_rate=pplay)
+                            self._tts_proc = proc_local
+                        except Exception as e:
+                            print(f"[tts] Piper play failed ({e}); falling back to say", flush=True)
+                            proc_local = None
+                    if proc_local is None:
+                        self._play_say_popen(text, voice=voice, rate=rate)
+                    else:
+                        # Stay inside _piper_synthesis_lock until playback finishes. If we released
+                        # the lock here, a second Test voice / TTS job could stop afplay mid-file
+                        # (_stop_tts_proc), which sounds like static or an abrupt cutoff.
+                        proc_local.wait()
             finally:
-                try:
-                    wav.unlink(missing_ok=True)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
+                if wav is not None:
+                    try:
+                        wav.unlink(missing_ok=True)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
 
         threading.Thread(target=worker, daemon=True).start()
 
