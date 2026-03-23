@@ -12,6 +12,7 @@ Run a local “Grok companion” that can:
 - **Self-upgrade via plugins**: ask “add X” and Loki can generate a plugin file in `loki_plugins/`.
 - **Authoritative time**: every model call includes **Unix epoch + ISO 8601** local/UTC in the system prompt; tool **`get_current_time`** for explicit checks.
 - **Apple Calendar (macOS)**: read/create/update/delete events in **Calendar.app** via automation tools (optional).
+- **Local art / image stack (optional)**: when **`LOKI_ART_WEBHOOK_URL`** is set, Loki gets tool **`submit_art_generation`** to POST prompts to *your* separate generator (ComfyUI bridge, A1111 API, custom server, etc.).
 
 This repo is evolving toward a fully local AI companion loop: perception (screen/files), action (desktop/toys), and memory (searchable recall).
 
@@ -59,6 +60,49 @@ python3 loki_direct.py
   **Tk note:** Homebrew Python may lack Tk (`ModuleNotFoundError: _tkinter`) — install **`brew install python-tk@VERSION`** to match your `python@VERSION`. **Xcode / Command Line Tools Python** can `import tkinter` but **crash in `TkpInit` (Tcl_Panic)**; the launcher skips those interpreters. Override with **`LOKI_OVERLAY_PYTHON=/path/to/python3`** if needed.
 
 Voice in the web UI is button-driven (press-and-hold) and uses your microphone + macOS `say` for speech.
+
+---
+
+## Local art / image generation (Loki → your app)
+
+Loki does **not** embed a diffusion engine. Anything that *would* stop him before was simply **no tool wired to your generator**. With a webhook configured, he can call **`submit_art_generation`** with a detailed prompt (and optional `negative_prompt` / `style_notes` / `seed`).
+
+### `.env` options
+
+| Variable | Meaning |
+|----------|---------|
+| **`LOKI_ART_WEBHOOK_URL`** | `http://127.0.0.1:…` URL your art app listens on for **POST JSON**. |
+| **`LOKI_ART_WEBHOOK_TIMEOUT_S`** | HTTP timeout (default `180`). Web UI allows extra headroom for this tool. |
+| **`LOKI_ART_WEBHOOK_HEADERS_JSON`** | Optional JSON object of extra headers, e.g. `{"Authorization":"Bearer …"}`. |
+| **`LOKI_ART_WEBHOOK_EXTRA_JSON`** | Optional JSON object **merged** into every request body (workflow id, size, etc.). |
+
+### Default JSON body shape
+
+Your service should accept a POST with JSON like:
+
+```json
+{
+  "prompt": "…",
+  "negative_prompt": "…",
+  "style_notes": "…",
+  "seed": 12345,
+  "source": "loki"
+}
+```
+
+(Only `prompt` and `source` are always present; other fields are omitted when empty.)
+
+You implement the server or use your art app’s HTTP API / a tiny bridge script that translates this into ComfyUI / Automatic1111 / Flux workflows.
+
+### Flux locally (realistic expectations)
+
+**Flux** is a family of image models, not a single Terminal download. Typical setup:
+
+1. Install a **UI or runtime** (e.g. **ComfyUI**, **Stable Diffusion WebUI Forge**, **InvokeAI**, etc.).
+2. Download **model weights** from the model hub (often **many GB**; may need a Hugging Face account / license acceptance).
+3. Point **`LOKI_ART_WEBHOOK_URL`** at a small **bridge** that receives Loki’s JSON and queues your workflow.
+
+There is **no one safe universal `brew install flux`** line—hardware (VRAM/RAM), chosen UI, and which Flux variant you use all change the steps. When you pick a stack (e.g. “ComfyUI + Flux Dev on my GPU”), we can wire the exact bridge payload next.
 
 ---
 

@@ -1687,7 +1687,12 @@ class LokiWebUI:
                     args = ld.json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
                 except Exception:
                     args = {}
-                result = self._run_tool_call_with_timeout(str(tool_name), args if isinstance(args, dict) else {})
+                timeout_s = 45.0
+                if str(tool_name) == "submit_art_generation":
+                    timeout_s = max(45.0, float(ld.LOKI_ART_WEBHOOK_TIMEOUT_S) + 30.0)
+                result = self._run_tool_call_with_timeout(
+                    str(tool_name), args if isinstance(args, dict) else {}, timeout_s=timeout_s
+                )
 
                 if tool_name in {"screenshot_monitor_base64", "screenshot_all_monitors_base64", "screenshot_left_base64", "screenshot_right_base64"}:
                     img_urls = ld.extract_image_data_urls(result)

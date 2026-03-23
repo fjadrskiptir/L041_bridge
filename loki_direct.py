@@ -159,6 +159,14 @@ LOKI_TIMEZONE = (os.getenv("LOKI_TIMEZONE") or "").strip()
 # macOS Calendar.app automation (JavaScript for Automation). Disable with LOKI_APPLE_CALENDAR=0.
 LOKI_APPLE_CALENDAR = os.getenv("LOKI_APPLE_CALENDAR", "1").strip() not in {"0", "false", "False", "no", "NO"}
 LOKI_APPLE_CALENDAR_DEFAULT = (os.getenv("LOKI_APPLE_CALENDAR_DEFAULT", "Calendar") or "Calendar").strip()
+
+# Optional hook for a **separate** local image / art app (ComfyUI bridge, A1111 API proxy, custom Flask, etc.).
+# Loki POSTs JSON to this URL when calling tool `submit_art_generation` (registered only if URL is set).
+LOKI_ART_WEBHOOK_URL = os.getenv("LOKI_ART_WEBHOOK_URL", "").strip()
+LOKI_ART_WEBHOOK_TIMEOUT_S = float(os.getenv("LOKI_ART_WEBHOOK_TIMEOUT_S", "180"))
+LOKI_ART_WEBHOOK_HEADERS_JSON = os.getenv("LOKI_ART_WEBHOOK_HEADERS_JSON", "").strip()
+# Optional static JSON object merged into every request body (e.g. {"workflow":"flux_default","width":1024}).
+LOKI_ART_WEBHOOK_EXTRA_JSON = os.getenv("LOKI_ART_WEBHOOK_EXTRA_JSON", "").strip()
 VOICE_ENABLE = os.getenv("LOKI_VOICE_ENABLE", "1").strip() not in {"0", "false", "False", "no", "NO"}
 VOICE_HOTKEY = os.getenv("LOKI_VOICE_HOTKEY", "ctrl_l").strip().lower() or "ctrl_l"
 VOICE_STT_MODEL = os.getenv("LOKI_VOICE_STT_MODEL", "base").strip() or "base"
@@ -561,6 +569,113 @@ def tool_web_search(query: str, max_results: Optional[int] = None) -> Dict[str, 
         "results": rows,
         "note": "Summarize and cite URLs for the user; snippets may be incomplete.",
     }
+
+
+def tool_submit_art_generation(
+    prompt: str,
+    negative_prompt: str = "",
+    style_notes: str = "",
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Forward an image-generation request to the user's local art stack via HTTP POST (JSON).
+
+    Configure `LOKI_ART_WEBHOOK_URL` in `.env`. Your service should accept a JSON body; default shape:
+      {"prompt": "...", "negative_prompt": "...", "style_notes": "...", "seed": <optional int>, "source": "loki"}
+
+    Merge fixed fields with `LOKI_ART_WEBHOOK_EXTRA_JSON` (JSON object). Add headers with `LOKI_ART_WEBHOOK_HEADERS_JSON`.
+    """
+
+    url = LOKI_ART_WEBHOOK_URL.strip()
+    if not url:
+        return {
+            "ok": False,
+            "error": "Art webhook not configured. Set LOKI_ART_WEBHOOK_URL in .env to your local art service URL.",
+        }
+    if not url.lower().startswith(("http://", "https://")):
+        return {"ok": False, "error": "LOKI_ART_WEBHOOK_URL must start with http:// or https://"}
+
+    p = (prompt or "").strip()
+    if not p:
+        return {"ok": False, "error": "prompt is empty"}
+    if len(p) > 12000:
+        return {"ok": False, "error": "prompt too long (max 12000 chars)"}
+
+    payload: Dict[str, Any] = {
+        "prompt": p,
+        "source": "loki",
+    }
+    np = (negative_prompt or "").strip()
+    if np:
+        payload["negative_prompt"] = np
+    sn = (style_notes or "").strip()
+    if sn:
+        payload["style_notes"] = sn
+    if seed is not None:
+        try:
+            payload["seed"] = int(seed)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "seed must be an integer"}
+
+    if LOKI_ART_WEBHOOK_EXTRA_JSON:
+        try:
+            extra = json.loads(LOKI_ART_WEBHOOK_EXTRA_JSON)
+            if isinstance(extra, dict):
+                payload.update(extra)
+            else:
+                return {"ok": False, "error": "LOKI_ART_WEBHOOK_EXTRA_JSON must be a JSON object"}
+        except json.JSONDecodeError as e:
+            return {"ok": False, "error": f"Invalid LOKI_ART_WEBHOOK_EXTRA_JSON: {e}"}
+
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/plain, */*"}
+    if LOKI_ART_WEBHOOK_HEADERS_JSON:
+        try:
+            h_extra = json.loads(LOKI_ART_WEBHOOK_HEADERS_JSON)
+            if isinstance(h_extra, dict):
+                for k, v in h_extra.items():
+                    headers[str(k)] = str(v)
+            else:
+                return {"ok": False, "error": "LOKI_ART_WEBHOOK_HEADERS_JSON must be a JSON object"}
+        except json.JSONDecodeError as e:
+            return {"ok": False, "error": f"Invalid LOKI_ART_WEBHOOK_HEADERS_JSON: {e}"}
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=max(5.0, float(LOKI_ART_WEBHOOK_TIMEOUT_S)))
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"Request failed: {e}", "url": url}
+
+    ct = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    body_preview = ""
+    parsed: Any = None
+    try:
+        text = resp.text
+    except Exception:
+        text = ""
+    if len(text) > 8000:
+        body_preview = text[:8000] + "…[truncated]"
+    else:
+        body_preview = text
+
+    if "json" in ct:
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = None
+
+    print(f"[art] webhook status={resp.status_code} url={url!r} prompt_len={len(p)}", flush=True)
+    out: Dict[str, Any] = {
+        "ok": 200 <= resp.status_code < 300,
+        "http_status": resp.status_code,
+        "content_type": ct or None,
+        "body_preview": body_preview,
+    }
+    if parsed is not None:
+        out["response_json"] = parsed
+    out["note"] = (
+        "Tell the user the job was submitted (or failed) based on http_status and body. "
+        "Your art app may return only an acknowledgement; images may appear on disk or in that app's UI."
+    )
+    return out
 
 
 def guess_mime(path: Path) -> str:
@@ -2630,6 +2745,13 @@ def build_base_system_static(memory_text: str) -> str:
             "Always confirm before deleting events.\n"
         )
 
+    if LOKI_ART_WEBHOOK_URL:
+        base += (
+            "The user runs a **separate local art / image-generation app**. When they (or you) want to create or revise "
+            "visual art, call `submit_art_generation` with a strong, concrete prompt (and optional negative_prompt / style_notes). "
+            "The tool POSTs to their configured webhook; generation may take minutes — confirm what the webhook response says.\n"
+        )
+
     persona = load_persona_instructions().strip()
     if persona:
         base += (
@@ -3108,6 +3230,44 @@ def build_core_tools(butt: ButtplugController, screen: Optional[ScreenController
                     fn=_cal_update,
                 )
             )
+
+    if LOKI_ART_WEBHOOK_URL:
+        tools.register(
+            ToolSpec(
+                name="submit_art_generation",
+                description=(
+                    "Submit a request to the user's **local** image/art generation software (configured via LOKI_ART_WEBHOOK_URL). "
+                    "Use when the user wants a new image, scene, character art, etc., or when offering to illustrate something. "
+                    "Write a detailed prompt (subject, style, lighting, composition). "
+                    "Optional negative_prompt for things to avoid; style_notes for medium (e.g. watercolor, 3D render). "
+                    "Returns HTTP status and response body from the art service."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "Full image generation prompt (detailed).",
+                        },
+                        "negative_prompt": {
+                            "type": "string",
+                            "description": "Optional: things to avoid in the image.",
+                        },
+                        "style_notes": {
+                            "type": "string",
+                            "description": "Optional: medium, artist reference, aspect hints (not a second full prompt).",
+                        },
+                        "seed": {
+                            "type": "integer",
+                            "description": "Optional reproducibility seed if the backend supports it.",
+                        },
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": False,
+                },
+                fn=tool_submit_art_generation,
+            )
+        )
 
     return tools
 
