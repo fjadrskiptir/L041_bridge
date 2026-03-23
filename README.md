@@ -240,6 +240,29 @@ Your **phone talks to Telegram’s servers**; **`loki_direct_webui.py` on your M
 
 **Remote restart notes:** `/loki_restart` works while Loki is running and reachable on Telegram. If the process is fully down, Telegram commands cannot reach it; for true self-healing, run Loki under a macOS LaunchAgent with `KeepAlive`.
 
+### macOS LaunchAgent (auto-restart / survives crashes)
+
+If you want Loki to come back automatically (including after re-login), install the LaunchAgent once:
+
+1. In Finder (or terminal), run:
+   - `install_loki_launchagent.command`
+2. It creates and loads:
+   - `~/Library/LaunchAgents/com.ness.loki.webui.plist`
+3. Logs:
+   - `/tmp/loki_launchagent.log`
+   - `/tmp/loki_launchagent.err.log`
+
+Uninstall:
+- `uninstall_loki_launchagent.command`
+
+Files used:
+- `run_loki_webui_service.sh` (service runner for launchd)
+
+Notes:
+- LaunchAgent uses `KeepAlive=true`, so if the process dies, launchd restarts it.
+- With LaunchAgent installed, `/loki_restart` from Telegram is more reliable remotely.
+- `/loki_stop` will stop the current process, but launchd may bring it back quickly (by design).
+
 ### Memory + DB paths
 - **`LOKI_MEMORY_DIR`**: default `memories`
 - **`LOKI_PERSONA_DIR`**: default `memories/persona`
