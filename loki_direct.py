@@ -127,6 +127,8 @@ CROSS_CHAT_LOG_PATH = Path(os.getenv("LOKI_CROSS_CHAT_LOG_PATH", str(MEMORY_DIR 
 CROSS_CHAT_PROMPT_MAX_CHARS = int(os.getenv("LOKI_CROSS_CHAT_PROMPT_MAX_CHARS", "8000"))
 CROSS_CHAT_LOG_ENABLED = os.getenv("LOKI_CROSS_CHAT_LOG", "1").strip() not in {"0", "false", "False", "no", "NO"}
 CROSS_CHAT_APPEND_HOME = os.getenv("LOKI_CROSS_CHAT_APPEND_HOME", "1").strip() not in {"0", "false", "False", "no", "NO"}
+# Prepend recent cross-session log to Brave Leo requests so the browser model sees home chat too.
+LOKI_BRAVE_LEO_INJECT_SYNC = os.getenv("LOKI_BRAVE_LEO_INJECT_SYNC", "1").strip() not in {"0", "false", "False", "no", "NO"}
 # If set, Brave Leo must send Authorization: Bearer <this> to POST /v1/chat/completions (same value in Brave "API Key").
 LOKI_LEO_BRIDGE_API_KEY = os.getenv("LOKI_LEO_BRIDGE_API_KEY", "").strip()
 

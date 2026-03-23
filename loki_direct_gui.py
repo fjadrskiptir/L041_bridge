@@ -490,7 +490,19 @@ class LokiGUI(tk.Tk):
         if isinstance(content, list):
             content = "\n".join([p.get("text", "") for p in content if isinstance(p, dict)])
 
+        last_user_plain = ""
+        if self.messages and self.messages[-1].get("role") == "user":
+            c = self.messages[-1].get("content")
+            if isinstance(c, str):
+                last_user_plain = c.split("\n\n---\n", 1)[0].strip()
+
         self.messages.append({"role": "assistant", "content": content})
+        if (
+            last_user_plain
+            and ld.CROSS_CHAT_APPEND_HOME
+            and not last_user_plain.lstrip().startswith("/")
+        ):
+            ld.append_cross_chat_log("loki_direct_gui", last_user_plain, str(content))
         self.after(0, lambda: self._render_chat("assistant", str(content)))
 
         if self.voice_mgr and self.voice_enabled and getattr(self.voice_mgr, "tts_enable", True):

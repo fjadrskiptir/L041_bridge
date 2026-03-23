@@ -36,7 +36,7 @@ _port_raw = str(_port_raw).strip()
 _port_match = re.search(r"([0-9]+)", _port_raw)
 APP_PORT = int(_port_match.group(1)) if _port_match else 7865
 APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
-WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-23.persona-panel")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-23.brave-leo-bridge")
 
 # JSON keys accepted for POST /api/tts/settings and POST /api/tts/test (apply before preview).
 _TTS_REQUEST_KEYS = (
@@ -139,7 +139,11 @@ class LokiWebUI:
         ld.set_persona_session_refresh_hook(_persona_session_refresh_web)
 
         self._register_routes()
-        print(f"[webui] version={WEBUI_VERSION} starting at http://{APP_HOST}:{APP_PORT}", flush=True)
+        print(
+            f"[webui] version={WEBUI_VERSION} starting at http://{APP_HOST}:{APP_PORT} "
+            f"(Brave Leo OpenAI bridge: http://{APP_HOST}:{APP_PORT}/v1)",
+            flush=True,
+        )
 
     def _enqueue_event(self, role: str, text: str) -> None:
         self.ui_events.put({"role": role, "text": text})
@@ -155,6 +159,8 @@ class LokiWebUI:
             assistant = self.handle_text(t, from_voice=True, blocking=True)
         except Exception as e:
             assistant = f"[error] {e}"
+        if ld.CROSS_CHAT_APPEND_HOME:
+            ld.append_cross_chat_log("loki_direct_webui_voice", t, assistant)
         self._enqueue_event("assistant", assistant)
 
     def _register_routes(self) -> None:
@@ -182,6 +188,8 @@ class LokiWebUI:
                 assistant = self.handle_text(text, from_voice=False, blocking=True)
             except Exception as e:
                 assistant = f"[error] {e}"
+            if ld.CROSS_CHAT_APPEND_HOME:
+                ld.append_cross_chat_log("loki_direct_webui", text, assistant)
             self._enqueue_event("assistant", assistant)
             return jsonify({"ok": True, "assistant": assistant})
 
@@ -247,6 +255,27 @@ class LokiWebUI:
         @self.app.route("/api/health", methods=["GET"])
         def api_health():
             return jsonify({"ok": True})
+
+        @self.app.route("/v1/models", methods=["GET"])
+        def openai_v1_models():
+            import loki_openai_bridge as bridge
+
+            err = bridge.verify_bridge_auth(request.headers)
+            if err:
+                return jsonify({"error": {"message": err, "type": "authentication_error"}}), 401
+            return jsonify(bridge.openai_models_payload()), 200
+
+        @self.app.route("/v1/chat/completions", methods=["POST"])
+        def openai_v1_chat_completions():
+            import loki_openai_bridge as bridge
+
+            err = bridge.verify_bridge_auth(request.headers)
+            if err:
+                return jsonify({"error": {"message": err, "type": "authentication_error"}}), 401
+            body = request.get_json(force=True) or {}
+            payload, code = bridge.openai_chat_completions(body, self.xai)
+            print("[webui] POST /v1/chat/completions (Brave Leo bridge)", flush=True)
+            return jsonify(payload), code
 
         @self.app.route("/api/persona", methods=["GET"])
         def api_persona_get():

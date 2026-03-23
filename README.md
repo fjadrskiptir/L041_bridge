@@ -125,6 +125,26 @@ Notes:
 There are three related layers:
 
 - **Personality (`memories/persona/instructions.md`)**: centralized markdown for how Loki **writes**, **behaves**, and **speaks in text** (tone, cadence, boundaries). Injected into the **system prompt** every reply. The **`memories/persona/`** tree is **excluded** from the generic snapshot below so it is not duplicated. **Web UI:** open **Personality & instructions** → edit → **Save & apply**. **Chat:** `/persona` (path + size), `/mem` (reload from disk). **From chat, Loki can edit it** using tools **`read_persona_instructions`** and **`update_persona_instructions`** (`mode`: `replace` for a full rewrite, `append` to add at the end); changes are saved to disk and the live session system prompt is refreshed automatically in Web UI / GUI / CLI.
+
+### Brave Leo (custom model) + shared memory with home Loki
+
+The **Web UI** exposes an **OpenAI-compatible** surface on the **same port** as the chat UI (default `7865`):
+
+- **`GET /v1/models`** — lists your configured **`XAI_MODEL`** (Brave’s **Model request name** must match that string exactly).
+- **`POST /v1/chat/completions`** — forwards the conversation to **Grok** (no tools). Each turn is appended to **`memories/cross_chat_log.jsonl`**.
+
+**Home Loki** (Web UI / GUI / CLI) **loads the tail of that log into the system prompt** on every model call (up to **`LOKI_CROSS_CHAT_PROMPT_MAX_CHARS`**, default 8000), so when you talk at home he can recall what you said in Brave. With **`LOKI_BRAVE_LEO_INJECT_SYNC=1`** (default), the bridge **also prepends** that same log to **Brave** requests so Leo sees recent home chat.
+
+**Brave settings (example):**
+
+1. Start **`loki_direct_webui.py`** and keep it running on the Mac where Brave runs (same machine, or tunnel/VPN if you know what you’re doing).
+2. **Server endpoint:** `http://127.0.0.1:7865/v1` (no trailing slash on some builds — if Brave fails, try with/without `/v1` per Brave’s hint text).
+3. **API Key:** optional locally; if you set **`LOKI_LEO_BRIDGE_API_KEY`** in `.env`, use the **same** value in Brave (sent as `Authorization: Bearer …`).
+4. **Model request name:** exactly **`XAI_MODEL`** from `.env` (e.g. `grok-4-1-fast-reasoning`).
+5. **Streaming:** not supported yet — disable stream if Brave offers it.
+6. **System prompt in Brave:** you can mirror **`memories/persona/instructions.md`** there for Leo’s tone; the **shared log** is separate and automatic.
+
+**Env toggles:** `LOKI_CROSS_CHAT_LOG`, `LOKI_CROSS_CHAT_LOG_PATH`, `LOKI_CROSS_CHAT_PROMPT_MAX_CHARS`, `LOKI_CROSS_CHAT_APPEND_HOME`, `LOKI_BRAVE_LEO_INJECT_SYNC`, `LOKI_LEO_BRIDGE_API_KEY`.
 - **Snapshot memory (`/mem`)**: loads other text files from `memories/` (recursive) into the system prompt.
 - **Vector memory (SQLite)**: ingests files into `loki_memory.sqlite3` for semantic recall on every user message.
 
