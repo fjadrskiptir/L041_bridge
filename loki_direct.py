@@ -122,6 +122,16 @@ PERSONA_INSTRUCTIONS_PATH = Path(
 ).resolve()
 PERSONA_INSTRUCTIONS_MAX_CHARS = int(os.getenv("LOKI_PERSONA_INSTRUCTIONS_MAX_CHARS", "48000"))
 
+# Shared log: Brave Leo (OpenAI-compatible bridge) + optional home UI → inject into system prompt for continuity.
+CROSS_CHAT_LOG_PATH = Path(os.getenv("LOKI_CROSS_CHAT_LOG_PATH", str(MEMORY_DIR / "cross_chat_log.jsonl"))).resolve()
+CROSS_CHAT_PROMPT_MAX_CHARS = int(os.getenv("LOKI_CROSS_CHAT_PROMPT_MAX_CHARS", "8000"))
+CROSS_CHAT_LOG_ENABLED = os.getenv("LOKI_CROSS_CHAT_LOG", "1").strip() not in {"0", "false", "False", "no", "NO"}
+CROSS_CHAT_APPEND_HOME = os.getenv("LOKI_CROSS_CHAT_APPEND_HOME", "1").strip() not in {"0", "false", "False", "no", "NO"}
+# If set, Brave Leo must send Authorization: Bearer <this> to POST /v1/chat/completions (same value in Brave "API Key").
+LOKI_LEO_BRIDGE_API_KEY = os.getenv("LOKI_LEO_BRIDGE_API_KEY", "").strip()
+
+_cross_chat_lock = threading.Lock()
+
 REQUEST_TIMEOUT_S = float(os.getenv("LOKI_HTTP_TIMEOUT_S", "60"))
 RETRIEVAL_K = int(os.getenv("LOKI_RETRIEVAL_K", "6"))
 WATCH_MEMORY_FOLDER = os.getenv("LOKI_WATCH_MEMORY_FOLDER", "1").strip() not in {"0", "false", "False", "no", "NO"}
@@ -347,6 +357,132 @@ def save_persona_instructions(content: str) -> None:
             f"Persona instructions too long ({len(text)} chars); max {PERSONA_INSTRUCTIONS_MAX_CHARS}"
         )
     PERSONA_INSTRUCTIONS_PATH.write_text(text, encoding="utf-8")
+
+
+# After tools update persona on disk, optional hook reloads the active chat session's system message.
+_persona_session_refresh: Optional[Callable[[], None]] = None
+
+
+def set_persona_session_refresh_hook(fn: Optional[Callable[[], None]]) -> None:
+    """Called from Web UI / GUI / CLI so `update_persona_instructions` refreshes the in-memory system prompt."""
+
+    global _persona_session_refresh
+    _persona_session_refresh = fn
+
+
+def _invoke_persona_session_refresh() -> Dict[str, Any]:
+    fn = _persona_session_refresh
+    if fn is None:
+        return {"ok": False, "hint": "Run /mem in chat to load the new persona into this session."}
+    try:
+        fn()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def tool_read_persona_instructions() -> Dict[str, Any]:
+    """Bound as `read_persona_instructions` tool (see build_core_tools)."""
+
+    return {
+        "path": str(PERSONA_INSTRUCTIONS_PATH),
+        "content": load_persona_instructions(),
+        "max_chars": PERSONA_INSTRUCTIONS_MAX_CHARS,
+    }
+
+
+def append_cross_chat_log(source: str, user_text: str, assistant_text: str) -> None:
+    """Append one turn to JSONL for Brave Leo ↔ home Loki continuity."""
+
+    if not CROSS_CHAT_LOG_ENABLED:
+        return
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "source": str(source)[:80],
+        "user": (user_text or "")[:120_000],
+        "assistant": (assistant_text or "")[:120_000],
+    }
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    try:
+        with _cross_chat_lock:
+            CROSS_CHAT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with CROSS_CHAT_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(line)
+    except OSError as e:
+        print(f"[cross_chat] append failed: {e}", flush=True)
+
+
+def load_cross_chat_for_system_prompt() -> str:
+    """Recent turns (newest-first packing) for system prompt — keep under CROSS_CHAT_PROMPT_MAX_CHARS."""
+
+    if not CROSS_CHAT_LOG_ENABLED:
+        return ""
+    p = CROSS_CHAT_LOG_PATH
+    if not p.is_file():
+        return ""
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    chunks: List[str] = []
+    total = 0
+    for ln in reversed(lines):
+        try:
+            o = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        ts = str(o.get("ts") or "")
+        src = str(o.get("source") or "?")
+        u = str(o.get("user") or "").strip()
+        a = str(o.get("assistant") or "").strip()
+        if not u and not a:
+            continue
+        piece = f"- **{ts}** `[{src}]`\n  **User:** {u}\n  **Assistant:** {a}\n"
+        if total + len(piece) > CROSS_CHAT_PROMPT_MAX_CHARS:
+            break
+        chunks.append(piece)
+        total += len(piece)
+    if not chunks:
+        return ""
+    chunks.reverse()
+    return "\n".join(chunks)
+
+
+def tool_update_persona_instructions(content: str, mode: str = "replace") -> Dict[str, Any]:
+    """Bound as `update_persona_instructions` tool."""
+
+    if not isinstance(content, str):
+        return {"ok": False, "error": "content must be a string"}
+    mode_n = (mode or "replace").strip().lower()
+    if mode_n not in ("replace", "append"):
+        return {"ok": False, "error": "mode must be 'replace' or 'append'"}
+
+    body = content
+    if mode_n == "append":
+        existing = load_persona_instructions().rstrip()
+        addition = content.strip()
+        if not addition:
+            return {"ok": False, "error": "append mode: content is empty"}
+        body = (existing + "\n\n" + addition + "\n") if existing else (addition + "\n")
+
+    try:
+        save_persona_instructions(body)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+
+    print(f"[persona] Tool updated instructions ({len(body)} chars, mode={mode_n})", flush=True)
+    refresh = _invoke_persona_session_refresh()
+    return {
+        "ok": True,
+        "path": str(PERSONA_INSTRUCTIONS_PATH),
+        "chars_total": len(body),
+        "mode": mode_n,
+        "session_refreshed": bool(refresh.get("ok")),
+        "session_refresh_detail": refresh,
+    }
 
 
 def guess_mime(path: Path) -> str:
@@ -2360,6 +2496,9 @@ def build_base_system_static(memory_text: str) -> str:
         "You are Loki, a local assistant controlling the user's computer and Intiface devices.\n"
         "Be concise, careful, and confirm risky actions.\n"
         "When a tool is appropriate, call it.\n"
+        "If the user asks to change your long-term personality, writing style, or behavioral rules, use tools "
+        "`read_persona_instructions` and `update_persona_instructions` (prefer mode `append` for small additions; "
+        "`replace` only with the full new markdown after reading the current file if needed).\n"
         "For visual understanding of the desktop, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
         "You receive an authoritative **clock block** (Unix epoch + ISO timestamps) on every model call—use it for real-world dates and timelines; "
         "when in doubt call `get_current_time`.\n"
@@ -2376,6 +2515,15 @@ def build_base_system_static(memory_text: str) -> str:
         base += (
             "\n\n### Personality & custom instructions (authoritative — follow unless the user overrides in this chat)\n"
             + persona
+            + "\n"
+        )
+
+    xctx = load_cross_chat_for_system_prompt().strip()
+    if xctx:
+        base += (
+            "\n\n### Recent cross-session chat (Brave Leo in browser + home Loki — same thread of truth; "
+            "use this so you remember what was said elsewhere unless the user contradicts)\n"
+            + xctx
             + "\n"
         )
 
@@ -2397,6 +2545,48 @@ def build_core_tools(butt: ButtplugController, screen: Optional[ScreenController
             description="List available commands/tools.",
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             fn=lambda: {"tools": tools.list_names()},
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="read_persona_instructions",
+            description=(
+                "Read the on-disk personality/custom instructions (markdown) from memories/persona/instructions.md. "
+                "Use before a full rewrite so you have the latest text (e.g. if the user may have edited it outside chat)."
+            ),
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            fn=tool_read_persona_instructions,
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="update_persona_instructions",
+            description=(
+                "Update memories/persona/instructions.md — steers how Loki writes, behaves, and sounds in text (tone, cadence, boundaries). "
+                "Use only when the user asks to change personality, style, rules, or similar. "
+                "For small additions use mode 'append'. For a full rewrite use mode 'replace' with the COMPLETE new markdown "
+                "(call read_persona_instructions first if you need the current file). "
+                "Persists to disk and refreshes the live system prompt when the app supports it."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Markdown body: full file for 'replace', or text to add at end for 'append'.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "append"],
+                        "description": "'replace' overwrites the file; 'append' adds after existing content with spacing.",
+                    },
+                },
+                "required": ["content"],
+                "additionalProperties": False,
+            },
+            fn=tool_update_persona_instructions,
         )
     )
 
@@ -2891,6 +3081,16 @@ def main() -> int:
     messages: List[Dict[str, Any]] = [{"role": "system", "content": compose_system_with_time(base_system_static)}]
 
     chat_lock = threading.Lock()
+
+    def _persona_session_refresh_cli() -> None:
+        nonlocal memory_text, base_system_static
+        with chat_lock:
+            memory_text, _ = load_memories(MEMORY_DIR)
+            base_system_static = build_base_system_static(memory_text)
+            refresh_system_time_message(messages, base_system_static)
+
+    set_persona_session_refresh_hook(_persona_session_refresh_cli)
+
     voice_mgr: Optional[VoiceManager] = None
 
     def _voice_stt_task(text: str) -> None:
@@ -3388,6 +3588,8 @@ def main() -> int:
             content = "\n".join([p.get("text", "") for p in content if isinstance(p, dict)])
         print(f"Loki> {content}")
         messages.append({"role": "assistant", "content": content})
+        if user_in and CROSS_CHAT_APPEND_HOME and not user_in.lstrip().startswith("/"):
+            append_cross_chat_log("loki_direct_cli", user_in, content)
 
     try:
         butt.stop_device("nora")

@@ -45,7 +45,8 @@ class LokiGUI(tk.Tk):
             self.screen = None
             self._ui_append("system", f"[screen] Disabled: {e}")
 
-        # Memory (snapshot prompt)
+        # Memory (snapshot prompt) + persona template on disk
+        ld.ensure_persona_template()
         self.memory_text, _mem_warnings = ld.load_memories(ld.MEMORY_DIR)
 
         # Tools + plugins
@@ -66,6 +67,13 @@ class LokiGUI(tk.Tk):
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": ld.compose_system_with_time(ld.build_base_system_static(self.memory_text))}
         ]
+
+        def _persona_session_refresh_gui() -> None:
+            with self.chat_lock:
+                self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
+                ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
+
+        ld.set_persona_session_refresh_hook(_persona_session_refresh_gui)
 
         # Voice manager (button-driven)
         self.voice_enabled = True
@@ -259,7 +267,10 @@ class LokiGUI(tk.Tk):
 
         # Commands
         if user_in == "/help":
-            self._ui_append("system", "Commands: /tools, /scan, /mem, /attach <path>, /ingest <path>, /compile_mem, /set_screen left <i>, /autodetect_screens, /upgrade <req>")
+            self._ui_append(
+                "system",
+                "Commands: /tools, /scan, /mem, /persona, /attach <path>, /ingest <path>, /compile_mem, /set_screen left <i>, /autodetect_screens, /upgrade <req>",
+            )
             return
         if user_in == "/tools":
             self._ui_append("system", "\n".join(self.tools.list_names()))
@@ -270,7 +281,19 @@ class LokiGUI(tk.Tk):
         if user_in == "/mem":
             self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
             self._refresh_system_prompt()
-            self._ui_append("system", f"[memory] Reloaded {ld.MEMORY_DIR}")
+            self._ui_append(
+                "system",
+                f"[memory] Reloaded {ld.MEMORY_DIR} + persona ({ld.PERSONA_INSTRUCTIONS_PATH.name})",
+            )
+            return
+
+        if user_in == "/persona":
+            ld.ensure_persona_template()
+            n = len(ld.load_persona_instructions())
+            self._ui_append(
+                "system",
+                f"[persona] {ld.PERSONA_INSTRUCTIONS_PATH}\n({n} chars, max {ld.PERSONA_INSTRUCTIONS_MAX_CHARS}) — /mem to refresh after edits.",
+            )
             return
 
         if user_in.startswith("/set_screen "):

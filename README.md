@@ -122,9 +122,10 @@ Notes:
 
 ## Persistent memory (vector DB + compiled doc)
 
-There are two “memory” systems:
+There are three related layers:
 
-- **Snapshot memory (`/mem`)**: loads text files from `memories/` and injects them into the system prompt.
+- **Personality (`memories/persona/instructions.md`)**: centralized markdown for how Loki **writes**, **behaves**, and **speaks in text** (tone, cadence, boundaries). Injected into the **system prompt** every reply. The **`memories/persona/`** tree is **excluded** from the generic snapshot below so it is not duplicated. **Web UI:** open **Personality & instructions** → edit → **Save & apply**. **Chat:** `/persona` (path + size), `/mem` (reload from disk). **From chat, Loki can edit it** using tools **`read_persona_instructions`** and **`update_persona_instructions`** (`mode`: `replace` for a full rewrite, `append` to add at the end); changes are saved to disk and the live session system prompt is refreshed automatically in Web UI / GUI / CLI.
+- **Snapshot memory (`/mem`)**: loads other text files from `memories/` (recursive) into the system prompt.
 - **Vector memory (SQLite)**: ingests files into `loki_memory.sqlite3` for semantic recall on every user message.
 
 ### Supported memory file types
@@ -163,6 +164,9 @@ Loki tries xAI embeddings, but will fall back to local hashing embeddings if you
 
 ### Memory + DB paths
 - **`LOKI_MEMORY_DIR`**: default `memories`
+- **`LOKI_PERSONA_DIR`**: default `memories/persona`
+- **`LOKI_PERSONA_INSTRUCTIONS_PATH`**: default `memories/persona/instructions.md`
+- **`LOKI_PERSONA_INSTRUCTIONS_MAX_CHARS`**: default `48000`
 - **`LOKI_INBOX_DIR`**: default `memories/inbox`
 - **`LOKI_PROCESSED_DIR`**: default `memories/processed`
 - **`LOKI_VECTOR_DB_PATH`**: default `loki_memory.sqlite3`

@@ -131,6 +131,13 @@ class LokiWebUI:
         )
         # Do NOT start hotkey listener; this UI drives start/stop recording.
 
+        def _persona_session_refresh_web() -> None:
+            with self.chat_lock:
+                self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
+                ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
+
+        ld.set_persona_session_refresh_hook(_persona_session_refresh_web)
+
         self._register_routes()
         print(f"[webui] version={WEBUI_VERSION} starting at http://{APP_HOST}:{APP_PORT}", flush=True)
 
@@ -450,6 +457,21 @@ class LokiWebUI:
     <button id="stop" disabled>Stop</button>
     <span class="small" id="status">Idle</span>
   </div>
+
+  <details id="personaPanel" style="margin-top:12px;border:1px solid #e0e0e0;border-radius:10px;padding:10px 12px;background:#fff">
+    <summary style="cursor:pointer;font-weight:600">Personality &amp; instructions (how Loki writes &amp; behaves)</summary>
+    <p class="small" style="margin:8px 0 6px 0;line-height:1.45">
+      One canonical markdown file lives under your memory folder. It is injected into the <b>system prompt</b> every reply (not vector search). Edit here or in any editor; use <b>Save &amp; apply</b> or chat command <code>/mem</code> after external edits.
+    </p>
+    <p class="small" style="margin:0 0 8px 0;word-break:break-all"><code id="personaPathEl">…</code></p>
+    <textarea id="personaText" rows="14" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;line-height:1.4" spellcheck="false" placeholder="Loading…"></textarea>
+    <div class="tts-actions" style="margin-top:10px">
+      <button type="button" id="personaSave">Save &amp; apply to chat</button>
+      <button type="button" id="personaReload">Reload from disk</button>
+      <button type="button" id="personaReveal">Reveal in Finder</button>
+    </div>
+    <p class="small" id="personaHint" style="margin-top:8px;color:#555"></p>
+  </details>
 
   <details id="ttsPanel">
     <summary>Voice &amp; speech (how Loki sounds)</summary>
@@ -1109,6 +1131,67 @@ class LokiWebUI:
     await applyTtsFormFromServer(d, 'Playing test with engine: ' + (d.tts_engine || '?') + '. ' + (d.settings_path || ''));
   }};
 
+  const personaPathEl = document.getElementById('personaPathEl');
+  const personaText = document.getElementById('personaText');
+  const personaHint = document.getElementById('personaHint');
+  const personaSave = document.getElementById('personaSave');
+  const personaReload = document.getElementById('personaReload');
+  const personaReveal = document.getElementById('personaReveal');
+
+  async function loadPersonaPanel() {{
+    if (!personaText) return;
+    personaHint.textContent = '';
+    try {{
+      const r = await fetch('/api/persona', {{ cache: 'no-store' }});
+      const d = await r.json();
+      if (!r.ok || !d.ok) {{
+        personaHint.textContent = (d && d.error) ? d.error : 'Could not load persona';
+        return;
+      }}
+      if (personaPathEl) personaPathEl.textContent = d.path || '';
+      personaText.value = d.content || '';
+      personaHint.textContent = 'Limit ' + (d.max_chars || '') + ' characters — Save applies to this chat session; /mem reloads from disk.';
+    }} catch (e) {{
+      personaHint.textContent = 'Failed to load persona';
+    }}
+  }}
+
+  if (personaSave) {{
+    personaSave.onclick = async () => {{
+      personaHint.textContent = 'Saving…';
+      try {{
+        const r = await fetch('/api/persona', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ content: personaText.value }}),
+          cache: 'no-store'
+        }});
+        const d = await r.json().catch(() => ({{}}));
+        if (!r.ok) {{
+          personaHint.textContent = (d && d.error) ? d.error : 'Save failed';
+          return;
+        }}
+        personaHint.textContent = 'Saved and applied to this chat session (' + (d.len || 0) + ' chars).';
+      }} catch (e) {{
+        personaHint.textContent = 'Save failed';
+      }}
+    }};
+  }}
+  if (personaReload) personaReload.onclick = () => loadPersonaPanel();
+  if (personaReveal) {{
+    personaReveal.onclick = async () => {{
+      try {{
+        const r = await fetch('/api/persona/reveal', {{ method: 'POST', cache: 'no-store' }});
+        const d = await r.json().catch(() => ({{}}));
+        if (!r.ok) personaHint.textContent = (d && d.error) ? d.error : 'Could not reveal file';
+        else personaHint.textContent = 'Finder should highlight the file.';
+      }} catch (e) {{
+        personaHint.textContent = 'Reveal failed';
+      }}
+    }};
+  }}
+
+  loadPersonaPanel();
   loadTtsUi();
 </script>
 </body>
@@ -1128,7 +1211,11 @@ class LokiWebUI:
             user_in = f"/attach {autop}"
 
         if user_in == "/help":
-            return "Commands: /tools, /scan, /mem, /attach <path>, /ingest <path>, /compile_mem, /set_screen left <i>, /autodetect_screens, /upgrade <req> — time: get_current_time; macOS Calendar: apple_calendar_* tools"
+            return (
+                "Commands: /tools, /scan, /mem, /persona, /attach <path>, /ingest <path>, /compile_mem, "
+                "/set_screen left <i>, /autodetect_screens, /upgrade <req> — time: get_current_time; "
+                "macOS Calendar: apple_calendar_* tools"
+            )
 
         if user_in == "/tools":
             return "\n".join(self.tools.list_names())
@@ -1139,7 +1226,19 @@ class LokiWebUI:
         if user_in == "/mem":
             self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
             ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
-            return f"[memory] Reloaded {ld.MEMORY_DIR}"
+            return (
+                f"[memory] Reloaded {ld.MEMORY_DIR} + persona ({ld.PERSONA_INSTRUCTIONS_PATH.name}). "
+                f"Path: {ld.PERSONA_INSTRUCTIONS_PATH}"
+            )
+
+        if user_in == "/persona":
+            ld.ensure_persona_template()
+            n = len(ld.load_persona_instructions())
+            return (
+                f"[persona] Instructions file:\n{ld.PERSONA_INSTRUCTIONS_PATH}\n"
+                f"[persona] Current length: {n} characters (max {ld.PERSONA_INSTRUCTIONS_MAX_CHARS}). "
+                "Run **/mem** after editing on disk to refresh the system prompt."
+            )
 
         if user_in.startswith("/set_screen "):
             raw = user_in[len("/set_screen ") :].strip()
