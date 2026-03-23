@@ -56,7 +56,7 @@ python3 loki_direct.py
   - After starting, open: `http://127.0.0.1:7865`
   - New: **Stealth toggle** in the control row quickly blurs chat text and dims sensitive panels.
 - **Desktop overlay (optional):** double-click `Start_L041_Overlay.command` for a small always-on-top orb that reflects state from `GET /api/presence` (`idle`, `listening`, `thinking`, `speaking`).  
-  **Tk note:** Homebrew Python often lacks Tk (`ModuleNotFoundError: _tkinter`). The launcher prefers **`/usr/bin/python3`** when it has Tk; otherwise install **`brew install python-tk@3.13`** (or your matching Python version).
+  **Tk note:** Homebrew Python may lack Tk (`ModuleNotFoundError: _tkinter`) — install **`brew install python-tk@VERSION`** to match your `python@VERSION`. **Xcode / Command Line Tools Python** can `import tkinter` but **crash in `TkpInit` (Tcl_Panic)**; the launcher skips those interpreters. Override with **`LOKI_OVERLAY_PYTHON=/path/to/python3`** if needed.
 
 Voice in the web UI is button-driven (press-and-hold) and uses your microphone + macOS `say` for speech.
 

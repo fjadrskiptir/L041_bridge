@@ -65,11 +65,9 @@ class Overlay:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("L041 Overlay")
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", OVERLAY_ALPHA)
         self.root.configure(bg="#000000")
         self.root.geometry(f"{OVERLAY_SIZE}x{OVERLAY_SIZE}+{OVERLAY_X}+{OVERLAY_Y}")
+        self.root.withdraw()
 
         self.canvas = tk.Canvas(self.root, width=OVERLAY_SIZE, height=OVERLAY_SIZE, bg="#000000", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -79,6 +77,25 @@ class Overlay:
         self._drag_start = None
         self._install_drag()
         self._tick()
+        self._show_window()
+
+    def _show_window(self) -> None:
+        # Some macOS Tk builds can abort if WM flags are set too early.
+        # Apply in a staged way and ignore unsupported flags.
+        self.root.deiconify()
+        self.root.update_idletasks()
+        try:
+            self.root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            self.root.attributes("-alpha", OVERLAY_ALPHA)
+        except tk.TclError:
+            pass
+        try:
+            self.root.overrideredirect(True)
+        except tk.TclError:
+            pass
 
     def _install_drag(self) -> None:
         def on_down(ev: tk.Event) -> None:
@@ -148,7 +165,16 @@ class Overlay:
         self.canvas.create_oval(cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner, fill=core, outline="")
         # Tiny badge in corner: S/L/T/I
         badge = {"speaking": "S", "listening": "L", "thinking": "T", "idle": "I"}[st]
-        self.canvas.create_text(OVERLAY_SIZE - 11, OVERLAY_SIZE - 10, text=badge, fill="#e9edf4", font=("Menlo", 9, "bold"))
+        try:
+            self.canvas.create_text(
+                OVERLAY_SIZE - 11,
+                OVERLAY_SIZE - 10,
+                text=badge,
+                fill="#e9edf4",
+                font=("TkDefaultFont", 9, "bold"),
+            )
+        except tk.TclError:
+            self.canvas.create_text(OVERLAY_SIZE - 11, OVERLAY_SIZE - 10, text=badge, fill="#e9edf4")
 
     def _tick(self) -> None:
         self._poll_presence()
