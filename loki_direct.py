@@ -154,6 +154,8 @@ except ValueError:
 
 # Authoritative clock in system prompt (epoch + ISO) — helps models reason about real dates/timelines.
 LOKI_TIME_SYSTEM_PROMPT = os.getenv("LOKI_TIME_SYSTEM_PROMPT", "1").strip() not in {"0", "false", "False", "no", "NO"}
+# Canonical timezone for all "local" time reasoning (recommended for consistent relative-date behavior).
+LOKI_TIMEZONE = (os.getenv("LOKI_TIMEZONE") or "").strip()
 # macOS Calendar.app automation (JavaScript for Automation). Disable with LOKI_APPLE_CALENDAR=0.
 LOKI_APPLE_CALENDAR = os.getenv("LOKI_APPLE_CALENDAR", "1").strip() not in {"0", "false", "False", "no", "NO"}
 LOKI_APPLE_CALENDAR_DEFAULT = (os.getenv("LOKI_APPLE_CALENDAR_DEFAULT", "Calendar") or "Calendar").strip()
@@ -2540,9 +2542,10 @@ def get_time_context_dict(iana_timezone: Optional[str] = None) -> Dict[str, Any]
     `epoch_seconds_utc` is the usual Unix timestamp (seconds since 1970-01-01 UTC).
     """
 
-    if iana_timezone and ZoneInfo is not None:
+    tz_pref = (iana_timezone or "").strip() or (LOKI_TIMEZONE or "").strip()
+    if tz_pref and ZoneInfo is not None:
         try:
-            now = datetime.now(ZoneInfo(iana_timezone))
+            now = datetime.now(ZoneInfo(tz_pref))
         except Exception:
             now = datetime.now().astimezone()
     else:
@@ -2562,18 +2565,23 @@ def get_time_context_dict(iana_timezone: Optional[str] = None) -> Dict[str, Any]
         "timezone": tz_label,
         "weekday_local": now.strftime("%A"),
         "date_local": now.strftime("%Y-%m-%d"),
-        "iana_timezone_requested": iana_timezone or "",
+        "iana_timezone_requested": (iana_timezone or "").strip(),
+        "iana_timezone_default": LOKI_TIMEZONE or "",
     }
 
 
 def time_context_prompt_block() -> str:
     d = get_time_context_dict()
+    tz_default_line = ""
+    if d.get("iana_timezone_default"):
+        tz_default_line = f"- **Configured default IANA timezone**: `{d['iana_timezone_default']}`\n"
     return (
         "### Current time (authoritative — do not guess from training data)\n"
         f"- **Unix epoch seconds (UTC-based instant)**: `{d['epoch_seconds_utc']}`\n"
         f"- **ISO 8601 local**: `{d['iso_local']}`\n"
         f"- **ISO 8601 UTC**: `{d['iso_utc']}`\n"
         f"- **Timezone**: `{d['timezone']}`\n"
+        f"{tz_default_line}"
         f"- **Local date / weekday**: `{d['date_local']}` / `{d['weekday_local']}`\n"
         "Resolve relative phrases (“tomorrow”, “next Friday”) using the local date above, or call `get_current_time`. "
         "For calendar events, prefer ISO 8601 with offset (e.g. `2026-03-20T15:30:00-07:00`).\n"

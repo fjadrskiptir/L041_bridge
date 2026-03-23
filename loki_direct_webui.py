@@ -68,6 +68,9 @@ class LokiWebUI:
         self.ui_events: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.chat_lock = threading.Lock()
         self._busy = False
+        self._presence_lock = threading.Lock()
+        self._presence_state = "idle"
+        self._presence_since = time.time()
 
         self.butt = ld.ButtplugController(ld.INTIFACE_WS)
         self.butt.start()
@@ -153,6 +156,22 @@ class LokiWebUI:
 
     def _enqueue_event(self, role: str, text: str) -> None:
         self.ui_events.put({"role": role, "text": text})
+
+    def _set_presence(self, state: str) -> None:
+        s = (state or "").strip().lower() or "idle"
+        if s not in {"idle", "listening", "thinking", "speaking"}:
+            s = "idle"
+        with self._presence_lock:
+            if self._presence_state == s:
+                return
+            self._presence_state = s
+            self._presence_since = time.time()
+
+    def _presence_snapshot(self) -> Dict[str, Any]:
+        with self._presence_lock:
+            state = self._presence_state
+            since = float(self._presence_since)
+        return {"state": state, "since_epoch_s": since, "age_s": max(0.0, time.time() - since)}
 
     def _on_voice_transcript(self, transcript: str) -> None:
         """STT callback: push chat lines to the event queue (voice has no /api/send client echo)."""
@@ -242,6 +261,7 @@ class LokiWebUI:
             try:
                 print("[webui] voice/start", flush=True)
                 self.voice_mgr.start_recording()
+                self._set_presence("listening")
             except Exception as e:
                 return jsonify({"ok": False, "reason": str(e)}), 500
             return jsonify({"ok": True})
@@ -253,6 +273,7 @@ class LokiWebUI:
             try:
                 print("[webui] voice/stop", flush=True)
                 self.voice_mgr.stop_recording()
+                self._set_presence("thinking")
             except Exception:
                 pass
             return jsonify({"ok": True})
@@ -272,6 +293,21 @@ class LokiWebUI:
         @self.app.route("/api/health", methods=["GET"])
         def api_health():
             return jsonify({"ok": True})
+
+        @self.app.route("/api/presence", methods=["GET"])
+        def api_presence():
+            snap = self._presence_snapshot()
+            recording = False
+            try:
+                if self.voice_mgr is not None:
+                    recording = bool(getattr(self.voice_mgr, "is_recording", lambda: False)())
+            except Exception:
+                recording = False
+            if recording:
+                snap["state"] = "listening"
+            snap["busy"] = bool(self._busy)
+            snap["recording"] = bool(recording)
+            return jsonify({"ok": True, **snap})
 
         @self.app.route("/api/telegram/status", methods=["GET"])
         def api_telegram_status():
@@ -456,58 +492,63 @@ class LokiWebUI:
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Loki Direct</title>
+  <title>L041</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 16px; }}
-    #log {{ border: 1px solid #ddd; height: 520px; overflow: auto; padding: 8px; border-radius: 8px; background: #fafafa; }}
+    :root {{ --stealth-blur: 0px; --stealth-dim: 1; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 16px; background:#0f1115; color:#f3f5f7; }}
+    #log {{ border: 1px solid #2b303b; height: 520px; overflow: auto; padding: 8px; border-radius: 8px; background: #171b22; filter: blur(var(--stealth-blur)); transition: filter .15s ease; }}
     .msg {{ margin: 6px 0; white-space: pre-wrap; }}
-    .user {{ color: #333; }}
-    .assistant {{ color: #0b5394; }}
-    .system {{ color: #555; font-style: italic; }}
+    .user {{ color: #f3f5f7; }}
+    .assistant {{ color: #9ecbff; }}
+    .system {{ color: #b8c0cc; font-style: italic; }}
     #controls {{ margin-top: 12px; display: flex; gap: 8px; }}
-    #text {{ flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 8px; }}
-    button {{ padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; background: white; cursor: pointer; }}
+    #text {{ flex: 1; padding: 10px; border: 1px solid #2b303b; border-radius: 8px; background:#11161d; color:#f3f5f7; }}
+    button {{ padding: 10px 14px; border: 1px solid #2b303b; border-radius: 8px; background: #1a2029; color:#f3f5f7; cursor: pointer; }}
     button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
     #voiceRow {{ margin-top: 12px; display: flex; gap: 10px; align-items: center; }}
-    #hold {{ background: #f7f7f7; }}
+    #hold {{ background: #1f2530; }}
     label {{ display: flex; align-items: center; gap: 8px; }}
-    .small {{ color: #666; font-size: 12px; }}
-    #ttsPanel {{ margin-top: 14px; border: 1px solid #e0e0e0; border-radius: 10px; padding: 10px 12px; background: #fff; }}
+    .small {{ color: #aeb6c2; font-size: 12px; }}
+    #ttsPanel {{ margin-top: 14px; border: 1px solid #2b303b; border-radius: 10px; padding: 10px 12px; background: #131923; opacity: var(--stealth-dim); transition: opacity .15s ease; }}
     #ttsPanel summary {{ cursor: pointer; font-weight: 600; }}
     .tts-row {{ margin: 10px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }}
     .tts-row label {{ flex: 1; min-width: 200px; }}
-    #ttsVoice {{ flex: 2; min-width: 220px; padding: 8px; border-radius: 8px; border: 1px solid #ddd; }}
+    #ttsVoice {{ flex: 2; min-width: 220px; padding: 8px; border-radius: 8px; border: 1px solid #2b303b; background:#11161d; color:#f3f5f7; }}
     #ttsRate {{ flex: 1; min-width: 160px; }}
     .tts-actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
     #piperVoiceGrid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin: 10px 0; max-height: 240px; overflow-y: auto; padding: 4px; }}
-    .piper-voice-card {{ display: block; width: 100%; text-align: left; padding: 12px 14px; border: 2px solid #e0e0e0; border-radius: 12px; background: #fff; cursor: pointer; font: inherit; transition: border-color .15s, background .15s; }}
-    .piper-voice-card:hover {{ border-color: #b8c9d9; background: #fafcfe; }}
-    .piper-voice-card--on {{ border-color: #0b5394; background: #e8f2fa; box-shadow: 0 0 0 1px #0b5394; }}
-    .pvc-title {{ font-weight: 600; font-size: 14px; word-break: break-word; line-height: 1.3; }}
-    .pvc-sub {{ font-size: 11px; color: #666; margin-top: 6px; }}
-    .piper-subhead {{ font-size: 14px; font-weight: 600; margin: 16px 0 8px 0; color: #333; }}
+    .piper-voice-card {{ display: block; width: 100%; text-align: left; padding: 12px 14px; border: 2px solid #2b303b; border-radius: 12px; background: #11161d; cursor: pointer; font: inherit; color:#f3f5f7; transition: border-color .15s, background .15s; }}
+    .piper-voice-card:hover {{ border-color: #5c7a97; background: #161d27; }}
+    .piper-voice-card--on {{ border-color: #66a9e4; background: #17324a; box-shadow: 0 0 0 1px #66a9e4; }}
+    .pvc-title {{ font-weight: 600; font-size: 14px; word-break: break-word; line-height: 1.3; color:#f3f5f7; }}
+    .pvc-sub {{ font-size: 11px; color: #aeb6c2; margin-top: 6px; }}
+    .piper-subhead {{ font-size: 14px; font-weight: 600; margin: 16px 0 8px 0; color: #dce2ea; }}
     .piper-slider-row {{ margin: 12px 0; }}
     .piper-slider-row label {{ display: block; font-size: 13px; margin-bottom: 4px; }}
     .piper-slider-row input[type=range] {{ width: 100%; max-width: 420px; vertical-align: middle; }}
-    .piper-slider-val {{ display: inline-block; min-width: 48px; margin-left: 8px; font-size: 12px; color: #0b5394; font-weight: 600; }}
-    .piper-advanced summary {{ cursor: pointer; color: #444; margin-top: 12px; }}
-    #piperDownloadHelp summary {{ cursor: pointer; color: #444; }}
+    .piper-slider-val {{ display: inline-block; min-width: 48px; margin-left: 8px; font-size: 12px; color: #8cc6ff; font-weight: 600; }}
+    .piper-advanced summary {{ cursor: pointer; color: #c9d3df; margin-top: 12px; }}
+    #piperDownloadHelp summary {{ cursor: pointer; color: #c9d3df; }}
     #piperUseCustomBtn {{ font-size: 13px; padding: 6px 12px; }}
     #webcamRow {{ margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }}
     #webcamPreviewWrap {{ border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: #111; min-height: 120px; display: none; }}
     #webcamPreviewWrap.on {{ display: block; }}
     #webcamVideo {{ display: block; max-width: 320px; max-height: 240px; width: auto; height: auto; }}
     #webcamHint {{ flex: 1; min-width: 200px; margin: 0; }}
+    #personaPanel {{ opacity: var(--stealth-dim); transition: opacity .15s ease; }}
+    code {{ color:#c3e1ff; }}
+    a {{ color:#8fc8ff; }}
   </style>
 </head>
 <body>
-  <h2>Loki Direct</h2>
+  <h2>L041</h2>
   <div class="small">UI version: {WEBUI_VERSION}</div>
   <div id="log"></div>
 
   <div id="controls">
     <input id="text" type="text" placeholder="Type a message (try: /tools, /attach <path>)"/>
     <button id="send">Send</button>
+    <button id="stealthToggle" type="button" title="Hide sensitive text quickly">Stealth Off</button>
   </div>
 
   <div id="webcamRow">
@@ -529,13 +570,13 @@ class LokiWebUI:
     <span class="small" id="status">Idle</span>
   </div>
 
-  <details id="personaPanel" style="margin-top:12px;border:1px solid #e0e0e0;border-radius:10px;padding:10px 12px;background:#fff">
-    <summary style="cursor:pointer;font-weight:600">Personality &amp; instructions (how Loki writes &amp; behaves)</summary>
+  <details id="personaPanel" style="margin-top:12px;border:1px solid #2b303b;border-radius:10px;padding:10px 12px;background:#131923">
+    <summary style="cursor:pointer;font-weight:600">Personality &amp; instructions (how L041 writes &amp; behaves)</summary>
     <p class="small" style="margin:8px 0 6px 0;line-height:1.45">
       One canonical markdown file lives under your memory folder. It is injected into the <b>system prompt</b> every reply (not vector search). Edit here or in any editor; use <b>Save &amp; apply</b> or chat command <code>/mem</code> after external edits.
     </p>
     <p class="small" style="margin:0 0 8px 0;word-break:break-all"><code id="personaPathEl">…</code></p>
-    <textarea id="personaText" rows="14" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;line-height:1.4" spellcheck="false" placeholder="Loading…"></textarea>
+    <textarea id="personaText" rows="14" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #2b303b;border-radius:8px;background:#11161d;color:#f3f5f7;font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;line-height:1.4" spellcheck="false" placeholder="Loading…"></textarea>
     <div class="tts-actions" style="margin-top:10px">
       <button type="button" id="personaSave">Save &amp; apply to chat</button>
       <button type="button" id="personaReload">Reload from disk</button>
@@ -545,7 +586,7 @@ class LokiWebUI:
   </details>
 
   <details id="ttsPanel">
-    <summary>Voice &amp; speech (how Loki sounds)</summary>
+    <summary>Voice &amp; speech (how L041 sounds)</summary>
     <p class="small" style="margin:8px 0 0 0">Choose <b>macOS say</b> or local neural <b>Piper</b> (<code>pip install piper-tts</code>). Settings save to <code>memories/tts_settings.json</code>.</p>
     <div class="tts-row">
       <label><input type="checkbox" id="ttsSpeakReplies" checked/> Speak replies (audio when Loki answers)</label>
@@ -678,6 +719,33 @@ class LokiWebUI:
   const voiceToggle = document.getElementById('voiceToggle');
   const holdBtn = document.getElementById('hold');
   const stopBtn = document.getElementById('stop');
+  const stealthToggle = document.getElementById('stealthToggle');
+  let stealthOn = false;
+
+  function applyStealthUI() {{
+    const root = document.documentElement;
+    if (stealthOn) {{
+      root.style.setProperty('--stealth-blur', '12px');
+      root.style.setProperty('--stealth-dim', '0.68');
+      if (stealthToggle) stealthToggle.textContent = 'Stealth On';
+      status.textContent = 'Stealth mode';
+    }} else {{
+      root.style.setProperty('--stealth-blur', '0px');
+      root.style.setProperty('--stealth-dim', '1');
+      if (stealthToggle) stealthToggle.textContent = 'Stealth Off';
+      if (status.textContent === 'Stealth mode') status.textContent = 'Idle';
+    }}
+  }}
+
+  if (stealthToggle) {{
+    stealthToggle.onclick = () => {{
+      stealthOn = !stealthOn;
+      applyStealthUI();
+      try {{ localStorage.setItem('l041_stealth', stealthOn ? '1' : '0'); }} catch (e) {{}}
+    }};
+    try {{ stealthOn = localStorage.getItem('l041_stealth') === '1'; }} catch (e) {{}}
+    applyStealthUI();
+  }}
 
   async function fetchWithTimeout(url, options = {{}}, timeoutMs = 95000) {{
     const controller = new AbortController();
@@ -773,7 +841,7 @@ class LokiWebUI:
   function add(role, text) {{
     const div = document.createElement('div');
     div.className = 'msg ' + role;
-    div.textContent = (role === 'user' ? 'You: ' : role === 'assistant' ? 'Loki: ' : '• ') + text;
+    div.textContent = (role === 'user' ? 'You: ' : role === 'assistant' ? 'L041: ' : '• ') + text;
     log.appendChild(div);
     log.scrollTop = log.scrollHeight;
   }}
@@ -1376,10 +1444,13 @@ class LokiWebUI:
 
         with self.chat_lock:
             self._busy = True
+            self._set_presence("thinking")
             try:
                 return self._handle_webcam_send_locked(user_text, image_data_url)
             finally:
                 self._busy = False
+                if self._presence_snapshot().get("state") != "speaking":
+                    self._set_presence("idle")
 
     def _handle_webcam_send_locked(self, user_text: str, image_data_url: str) -> str:
         url = ld.validate_image_data_url(image_data_url)
@@ -1430,10 +1501,13 @@ class LokiWebUI:
     def handle_text(self, user_in: str, from_voice: bool, blocking: bool = True, *, skip_tts: bool = False) -> str:
         with self.chat_lock:
             self._busy = True
+            self._set_presence("thinking")
             try:
                 return self._handle_text_locked(user_in, skip_tts=skip_tts)
             finally:
                 self._busy = False
+                if self._presence_snapshot().get("state") != "speaking":
+                    self._set_presence("idle")
 
     def _handle_text_locked(self, user_in: str, *, skip_tts: bool = False) -> str:
         autop = ld.looks_like_existing_path(user_in)
@@ -1659,9 +1733,14 @@ class LokiWebUI:
         # TTS only when Voice On is enabled (checkbox syncs /api/voice/toggle). Telegram skips TTS.
         if not skip_tts and self.voice_enabled and self.voice_mgr:
             try:
+                self._set_presence("speaking")
                 self.voice_mgr.speak(str(content))
             except Exception:
                 pass
+            finally:
+                self._set_presence("idle")
+        else:
+            self._set_presence("idle")
 
         return str(content)
 

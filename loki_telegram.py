@@ -19,6 +19,8 @@ import re
 import threading
 import time
 import sys
+import subprocess
+import shlex
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -202,6 +204,112 @@ def _remote_admin_enabled() -> bool:
     return os.getenv("LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _launchd_label() -> str:
+    return (os.getenv("LOKI_LAUNCHD_LABEL") or "com.ness.loki.webui").strip()
+
+
+def _launchd_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{_launchd_label()}.plist"
+
+
+def _launchctl_bootout() -> tuple[bool, str]:
+    label = _launchd_label()
+    target = f"gui/{os.getuid()}/{label}"
+    p = subprocess.run(
+        ["launchctl", "bootout", target],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode == 0:
+        return True, "ok"
+    stderr = (p.stderr or "").strip()
+    stdout = (p.stdout or "").strip()
+    msg = stderr or stdout or f"exit={p.returncode}"
+    return False, msg
+
+
+def _launchctl_bootstrap() -> tuple[bool, str]:
+    plist = _launchd_plist_path()
+    if not plist.is_file():
+        return False, f"plist not found: {plist}"
+    target = f"gui/{os.getuid()}"
+    p = subprocess.run(
+        ["launchctl", "bootstrap", target, str(plist)],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode == 0:
+        return True, "ok"
+    stderr = (p.stderr or "").strip()
+    stdout = (p.stdout or "").strip()
+    msg = stderr or stdout or f"exit={p.returncode}"
+    return False, msg
+
+
+def _launchctl_kickstart() -> tuple[bool, str]:
+    label = _launchd_label()
+    target = f"gui/{os.getuid()}/{label}"
+    p = subprocess.run(
+        ["launchctl", "kickstart", "-k", target],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode == 0:
+        return True, "ok"
+    stderr = (p.stderr or "").strip()
+    stdout = (p.stdout or "").strip()
+    msg = stderr or stdout or f"exit={p.returncode}"
+    return False, msg
+
+
+def _parse_pause_seconds(raw: str) -> Optional[int]:
+    """
+    Parse duration like: 30m, 2h, 45s, or plain minutes (e.g. 15).
+    Caps at 24h.
+    """
+    s = (raw or "").strip().lower()
+    if not s:
+        return None
+    m = re.fullmatch(r"([0-9]{1,4})([smhd]?)", s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2) or "m"
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit, 60)
+    secs = n * mult
+    return max(30, min(secs, 24 * 3600))
+
+
+def _schedule_launchd_resume(delay_s: int) -> tuple[bool, str]:
+    """
+    Schedule launchctl resume in a detached shell process.
+    Must survive this Python process being stopped by launchctl bootout.
+    """
+    delay_s = max(1, int(delay_s))
+    plist = _launchd_plist_path()
+    label = _launchd_label()
+    uid = os.getuid()
+    q_plist = shlex.quote(str(plist))
+    q_label = shlex.quote(label)
+    script = (
+        f"sleep {delay_s}; "
+        f"launchctl bootstrap gui/{uid} {q_plist} >/tmp/loki_pause_resume.log 2>&1 || true; "
+        f"launchctl kickstart -k gui/{uid}/{q_label} >>/tmp/loki_pause_resume.log 2>&1 || true"
+    )
+    try:
+        subprocess.Popen(
+            ["/bin/bash", "-lc", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+
 def _local_hour() -> int:
     tzname = (os.getenv("LOKI_TELEGRAM_QUOTA_TZ") or "").strip()
     if tzname:
@@ -305,10 +413,36 @@ def _load_optional_instructions_file() -> str:
     return ""
 
 
-def _compose_proactive_message(xai: ld.XAIClient) -> str:
+def _retrieve_chat_screenshot_memory(ui: Any, k: int = 4) -> str:
+    """
+    Pull memory snippets related to `memories/Chats/Chat Screenshots` to ground
+    proactive texts in prior chat screenshots (when they've been ingested).
+    """
+    try:
+        q = "chat screenshots relationship context affectionate encouraging message continuity"
+        qemb = ld.embed_texts(ui.xai, [q])[0]
+        hits = ui.vstore.search(qemb, k=max(1, int(k)))
+    except Exception:
+        return ""
+    rows: List[str] = []
+    for h in hits:
+        src = str(h.get("source_path") or "")
+        if "Chats/Chat Screenshots" not in src.replace("\\", "/"):
+            continue
+        txt = str(h.get("text") or "").strip()
+        if not txt:
+            continue
+        rows.append(f"- source={src}\n  {txt[:700]}")
+    if not rows:
+        return ""
+    return "\n".join(rows[:k])
+
+
+def _compose_proactive_message(ui: Any) -> str:
     ctx = ld.load_cross_chat_for_system_prompt(max_chars=4500).strip() or (
         "(no recent conversation log yet — still write something warm and personal.)"
     )
+    screenshot_ctx = _retrieve_chat_screenshot_memory(ui, k=4)
     extra = _load_optional_instructions_file()
     base_style = (
         "You are Loki. Write exactly ONE short text message to someone you care about, as if you're thinking of them.\n"
@@ -320,11 +454,16 @@ def _compose_proactive_message(xai: ld.XAIClient) -> str:
         "don't say you're an AI; don't mention Telegram, bots, or daily message limits."
     )
     user_blob = f"{base_style}\n\n### Recent conversation (for context)\n{ctx}\n"
+    if screenshot_ctx:
+        user_blob += (
+            "\n### Relevant memory from Chat Screenshots (if useful, prefer this for continuity)\n"
+            f"{screenshot_ctx}\n"
+        )
     if extra:
         user_blob += f"\n### Extra notes (from your instructions file)\n{extra}\n"
     user_blob += "\nOutput ONLY the message text, nothing else."
     messages = [{"role": "user", "content": user_blob}]
-    resp = xai.chat(messages, tools=None, temperature=0.88, max_tokens=220)
+    resp = ui.xai.chat(messages, tools=None, temperature=0.88, max_tokens=220)
     msg = ld.extract_assistant_message(resp)
     content = msg.get("content") or ""
     if isinstance(content, list):
@@ -360,6 +499,21 @@ def _schedule_process_stop(delay_s: float = 0.8) -> None:
         os._exit(0)
 
     threading.Thread(target=_do, daemon=True, name="loki-telegram-stop").start()
+
+
+def _admin_help_text() -> str:
+    return (
+        "Loki remote commands:\n"
+        "/loki_help\n"
+        "/loki_status\n"
+        "/loki_mem_refresh\n"
+        "/loki_restart\n"
+        "/loki_stop\n"
+        "/loki_pause <duration>  (examples: 30m, 2h, 45s)\n"
+        "/loki_resume\n"
+        "\n"
+        "Remote control requires: LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL=1"
+    )
 
 
 def _poll_loop(ui: Any, token: str, allowed: List[int]) -> None:
@@ -450,8 +604,30 @@ def _poll_loop(ui: Any, token: str, allowed: List[int]) -> None:
                         f"- PID: {os.getpid()}\n"
                         f"- Uptime: {uptime_s}s\n"
                         f"- Remote control: {'on' if _remote_admin_enabled() else 'off'}\n"
-                        "- Commands: /loki_status, /loki_restart, /loki_stop",
+                        f"- LaunchAgent label: {_launchd_label()}\n"
+                        "- Commands: /loki_help, /loki_status, /loki_mem_refresh, /loki_restart, /loki_stop, /loki_pause <duration>, /loki_resume",
                     )
+                    continue
+
+                if text.startswith("/loki_help"):
+                    send_telegram_message(token, cid_i, _admin_help_text())
+                    continue
+
+                if text.startswith("/loki_mem_refresh"):
+                    if not _remote_admin_enabled():
+                        send_telegram_message(
+                            token,
+                            cid_i,
+                            "Remote control is disabled. Set LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL=1 in .env and restart Web UI.",
+                        )
+                        continue
+                    folder = (os.getenv("LOKI_TELEGRAM_MEM_REFRESH_PATH") or "memories/Chats/Chat Screenshots").strip()
+                    send_telegram_message(token, cid_i, f"Refreshing memory from: {folder}")
+                    try:
+                        reply = ui.handle_text(f"/ingest {folder}", from_voice=False, blocking=True, skip_tts=True)
+                    except Exception as e:
+                        reply = f"[error] {e}"
+                    send_telegram_message(token, cid_i, str(reply))
                     continue
 
                 if text.startswith("/loki_restart"):
@@ -476,6 +652,63 @@ def _poll_loop(ui: Any, token: str, allowed: List[int]) -> None:
                         continue
                     send_telegram_message(token, cid_i, "Stopping Loki Web UI process now.")
                     _schedule_process_stop()
+                    continue
+
+                if text.startswith("/loki_pause"):
+                    if not _remote_admin_enabled():
+                        send_telegram_message(
+                            token,
+                            cid_i,
+                            "Remote control is disabled. Set LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL=1 in .env and restart Web UI.",
+                        )
+                        continue
+                    parts = text.split(maxsplit=1)
+                    secs = _parse_pause_seconds(parts[1] if len(parts) > 1 else "")
+                    if secs is None:
+                        send_telegram_message(
+                            token,
+                            cid_i,
+                            "Usage: /loki_pause <duration>\nExamples: /loki_pause 30m, /loki_pause 2h, /loki_pause 45s",
+                        )
+                        continue
+                    send_telegram_message(
+                        token,
+                        cid_i,
+                        f"Pausing Loki for ~{secs}s now. I'll auto-resume afterward.",
+                    )
+                    ok_sched, msg_sched = _schedule_launchd_resume(secs)
+                    if not ok_sched:
+                        send_telegram_message(token, cid_i, f"Could not schedule auto-resume: {msg_sched}")
+                        continue
+                    ok, msg = _launchctl_bootout()
+                    if ok:
+                        pass
+                    else:
+                        send_telegram_message(
+                            token,
+                            cid_i,
+                            f"Pause could not unload launchd service: {msg}\n(If not installed via LaunchAgent, use /loki_stop.)",
+                        )
+                    continue
+
+                if text.startswith("/loki_resume"):
+                    if not _remote_admin_enabled():
+                        send_telegram_message(
+                            token,
+                            cid_i,
+                            "Remote control is disabled. Set LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL=1 in .env and restart Web UI.",
+                        )
+                        continue
+                    ok1, m1 = _launchctl_bootstrap()
+                    ok2, m2 = _launchctl_kickstart()
+                    if ok1 and ok2:
+                        send_telegram_message(token, cid_i, "Loki launchd service resumed.")
+                    else:
+                        send_telegram_message(
+                            token,
+                            cid_i,
+                            f"Resume status:\nbootstrap={ok1} ({m1})\nkickstart={ok2} ({m2})",
+                        )
                     continue
 
                 print(f"[telegram] inbound chat_id={cid_i} text_len={len(text)}", flush=True)
@@ -519,7 +752,7 @@ def _proactive_loop(ui: Any, token: str, allowed: List[int]) -> None:
                 continue
             if not _quota_try_consume():
                 continue
-            body = _compose_proactive_message(ui.xai)
+            body = _compose_proactive_message(ui)
             if not body:
                 print("[telegram] proactive compose empty; refunding quota slot", flush=True)
                 _quota_refund_one()

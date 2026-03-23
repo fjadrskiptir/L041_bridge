@@ -54,6 +54,8 @@ python3 loki_direct.py
 
 - **Web UI (macOS)**: double-click `Start_Loki_GUI.command` to open a basic browser UI with buttons (including Hold-to-Talk and **Camera on / Send with camera**).
   - After starting, open: `http://127.0.0.1:7865`
+  - New: **Stealth toggle** in the control row quickly blurs chat text and dims sensitive panels.
+- **Desktop overlay (optional):** double-click `Start_L041_Overlay.command` for a small always-on-top orb that reflects state from `GET /api/presence` (`idle`, `listening`, `thinking`, `speaking`).
 
 Voice in the web UI is button-driven (press-and-hold) and uses your microphone + macOS `say` for speech.
 
@@ -232,11 +234,27 @@ Your **phone talks to Telegram’s servers**; **`loki_direct_webui.py` on your M
 - **`LOKI_TELEGRAM_QUOTA_PATH`**: override path for the quota JSON (default `memories/telegram_proactive_quota.json`).
 - **`LOKI_TELEGRAM_PROACTIVE_INSTRUCTIONS_PATH`**: optional file; otherwise **`memories/telegram_proactive_instructions.md`** is read if present. See `memories/telegram_proactive_instructions.example.md`.
 - **`LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL`**: default `0`. Set `1` to allow Telegram admin commands from allowed chat ids:
+  - **`/loki_help`**: list remote admin commands
   - **`/loki_status`**: process status (pid/uptime)
+  - **`/loki_mem_refresh`**: run `/ingest` for chat screenshots (default path `memories/Chats/Chat Screenshots`)
   - **`/loki_restart`**: restart the running Web UI process
   - **`/loki_stop`**: stop the running Web UI process
+  - **`/loki_pause <duration>`**: unload launchd service now, auto-resume later (examples: `30m`, `2h`, `45s`)
+  - **`/loki_resume`**: manually re-bootstrap + kickstart launchd service
+- **`LOKI_TELEGRAM_MEM_REFRESH_PATH`**: optional override for `/loki_mem_refresh` ingest target folder.
+
+Overlay tuning env vars (optional):
+- **`LOKI_OVERLAY_PRESENCE_URL`**: default `http://127.0.0.1:7865/api/presence`
+- **`LOKI_OVERLAY_SIZE`**: orb size in px (default `96`)
+- **`LOKI_OVERLAY_ALPHA`**: window opacity `0.2-1.0` (default `0.92`)
+- **`LOKI_OVERLAY_X`** / **`LOKI_OVERLAY_Y`**: screen position (default `24`, `24`)
+- **`LOKI_OVERLAY_HUE_SHIFT_DEG`**: hue tint (default `0`)
+- **`LOKI_OVERLAY_POLL_MS`**: poll interval (default `250`)
 
 **Privacy:** only chat ids in **`TELEGRAM_ALLOWED_CHAT_IDS`** get replies. Inbound Telegram turns do **not** trigger Mac TTS (so your speaker doesn’t read every phone message aloud).
+
+Proactive Telegram texts now also try to ground style/context from ingested memory chunks whose source path contains **`Chats/Chat Screenshots`**.  
+Tip: run `/ingest memories/Chats/Chat Screenshots` at least once so those screenshots are represented in vector memory.
 
 **Remote restart notes:** `/loki_restart` works while Loki is running and reachable on Telegram. If the process is fully down, Telegram commands cannot reach it; for true self-healing, run Loki under a macOS LaunchAgent with `KeepAlive`.
 
@@ -285,6 +303,8 @@ Notes:
 
 ### Time
 - **`LOKI_TIME_SYSTEM_PROMPT`**: `1` (on) / `0` (off) — inject epoch + ISO clock block every model call
+- **`LOKI_TIMEZONE`**: optional IANA timezone for consistent local-date reasoning.  
+  Puerto Rico (no DST): **`America/Puerto_Rico`**
 
 ### Apple Calendar (macOS only)
 - **`LOKI_APPLE_CALENDAR`**: `1` (on) / `0` (off)
