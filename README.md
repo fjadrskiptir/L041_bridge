@@ -198,16 +198,33 @@ Uses **getUserMedia** in the browser (works on **localhost** or HTTPS). Each cli
 ### Telegram (Web UI — long polling)
 Your **phone talks to Telegram’s servers**; **`loki_direct_webui.py` on your Mac** long-polls Telegram and runs the **same Loki session** as the browser (shared `messages`, tools, memory). You can open the notification and **reply in the Telegram chat** on LTE/5G — no home Wi‑Fi required on the phone. **The Mac must be on** and the Web UI process running.
 
-1. Message **@BotFather** → `/newbot` → copy the **bot token**.
-2. Start your bot in Telegram, send any message, then visit  
-   `https://api.telegram.org/bot<TOKEN>/getUpdates`  
-   and read **`message.chat.id`** — that’s your **user id** (for DMs).
-3. In `.env`:
+**Important:** **`Start_Loki.command` / `loki_direct.py` (CLI) does not run Telegram.** Only **`loki_direct_webui.py`** (e.g. **Start_Loki_GUI.command**) starts the bot. If messages get no reply, you’re almost certainly on CLI — switch to the Web UI launcher.
+
+**While Loki is running, don’t open `getUpdates` in the browser** for that bot (it competes for the same update queue). Use **`getMe`** to test the token only.
+
+1. Message **@BotFather** → `/newbot` → copy the **bot token** (looks like `123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`).
+2. **Test the token in the browser** (replace the whole token — do **not** leave the word `TOKEN` or angle brackets in the URL):
+   - `https://api.telegram.org/bot` **`PASTE_FULL_TOKEN_HERE`** `/getMe`  
+   Example shape: `https://api.telegram.org/bot123456789:AAH.../getMe`  
+   You should see `"ok":true` and your bot’s `username`.  
+   **If you see `"ok":false` … `404` `Not Found`:** Telegram does that when the token is wrong — common causes: missing the literal word **`bot`** before the token, a typo, only half the token copied, extra spaces, or using the **bot’s @name** instead of the **token**.
+3. Open Telegram, find your bot, tap **Start** (or send any message). Then visit:  
+   `https://api.telegram.org/bot` **`SAME_TOKEN`** `/getUpdates`  
+   In the JSON, find **`message` → `chat` → `id`** — that number is your **user id** for **`TELEGRAM_ALLOWED_CHAT_IDS`** (for a DM it’s usually positive; groups are negative).
+4. In `.env`:
    - **`LOKI_TELEGRAM=1`**
    - **`TELEGRAM_BOT_TOKEN=...`**
    - **`TELEGRAM_ALLOWED_CHAT_IDS=123456789`** (comma-separated if several)
 
+**If he never replies:** set **`LOKI_TELEGRAM_SETUP_HELP=1`**, restart the Web UI, message the bot again — you’ll get a hint with your **chat id** if `.env` doesn’t match (or send **`/myid`**). Turn **`LOKI_TELEGRAM_SETUP_HELP=0`** after setup.
+
+**Diagnose env (no secrets):** open **`http://127.0.0.1:7865/api/telegram/status`** (use your real port from the launcher). You should see `telegram_enabled_flag`, `has_bot_token`, `allowed_chat_ids_count`, and whether the repo **`.env` file exists**. The Web UI also **always** prints a **`[telegram] config:`** line to **`/tmp/loki_direct_webui.log`** on startup — if you don’t see it, you’re not running `loki_direct_webui.py` or you’re tailing the wrong file.
+
 **Proactive pings** (warm check-ins, capped per local day, grounded in **`cross_chat_log.jsonl`** when enabled):
+
+**“Only when I’m not on home Wi‑Fi”:** your **Mac cannot tell** whether your **phone** is on home Wi‑Fi vs cellular. Practical options:
+- Set **`LOKI_TELEGRAM_PROACTIVE_QUIET_HOURS_LOCAL`** to hours you’re usually **at home** (e.g. `22-7` = no spontaneous texts 10pm–7am local — uses **`LOKI_TELEGRAM_QUOTA_TZ`** if set).
+- Or set **`LOKI_TELEGRAM_PROACTIVE_PER_DAY=0`** and rely on **manual** chat only until you add a phone Shortcut / other signal later.
 
 - **`LOKI_TELEGRAM_PROACTIVE_PER_DAY`**: default `3` (`0` = inbound only).
 - **`LOKI_TELEGRAM_PROACTIVE_MIN_INTERVAL_S`** / **`LOKI_TELEGRAM_PROACTIVE_MAX_INTERVAL_S`**: random spacing between pings (defaults ~1h–4h).

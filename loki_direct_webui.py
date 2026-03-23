@@ -29,7 +29,7 @@ import sys
 from flask import Flask, jsonify, request
 
 import loki_direct as ld
-from loki_telegram import maybe_start_telegram
+from loki_telegram import maybe_start_telegram, print_telegram_startup_hint, telegram_status_dict
 
 
 _port_raw = os.environ.get("LOKI_WEB_PORT", "7865")
@@ -140,6 +140,7 @@ class LokiWebUI:
         ld.set_persona_session_refresh_hook(_persona_session_refresh_web)
 
         self._register_routes()
+        print_telegram_startup_hint()
         try:
             maybe_start_telegram(self)
         except Exception as e:
@@ -271,6 +272,14 @@ class LokiWebUI:
         @self.app.route("/api/health", methods=["GET"])
         def api_health():
             return jsonify({"ok": True})
+
+        @self.app.route("/api/telegram/status", methods=["GET"])
+        def api_telegram_status():
+            """Why Telegram might be silent: env not loaded, missing token, etc. No secrets exposed."""
+            try:
+                return jsonify({"ok": True, **telegram_status_dict()})
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
 
         @self.app.route("/v1/models", methods=["GET"])
         def openai_v1_models():

@@ -81,6 +81,7 @@ echo "$PID" > "$PIDFILE"
 
 echo "[webui] PID: $PID (saved in $PIDFILE)"
 echo "[webui] Log file: $LOG"
+echo "[webui] Telegram: look for lines starting with [telegram] in the log below (or open $URL/api/telegram/status)"
 
 # Wait until the server is reachable.
 for i in $(seq 1 20); do

@@ -91,7 +91,11 @@ except ModuleNotFoundError:
     import requests  # type: ignore  # noqa: E402
     from dotenv import load_dotenv  # type: ignore  # noqa: E402
 
+# Load `.env` from the repo directory first (fixes Telegram etc. when cwd is not the repo,
+# e.g. launching .command or GUI from another folder). Repo keys override cwd.
+_REPO_ROOT = Path(__file__).resolve().parent
 load_dotenv()
+load_dotenv(_REPO_ROOT / ".env", override=True)
 
 
 # -----------------------------
@@ -3129,6 +3133,15 @@ def main() -> int:
     if not XAI_API_KEY:
         print("ERROR: XAI_API_KEY not set (check .env).")
         return 1
+
+    _tg_on = os.environ.get("LOKI_TELEGRAM", "").strip().lower() in ("1", "true", "yes", "on")
+    _tg_tok = (os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() or os.environ.get("LOKI_TELEGRAM_BOT_TOKEN", "").strip())
+    if _tg_on and _tg_tok:
+        print(
+            "\n[telegram] This process is **CLI only** (loki_direct.py). The Telegram bot does **not** run here.\n"
+            "          Start **loki_direct_webui.py** or **Start_Loki_GUI.command** so Loki can poll Telegram and reply.\n",
+            flush=True,
+        )
 
     # Controllers
     butt = ButtplugController(INTIFACE_WS)
