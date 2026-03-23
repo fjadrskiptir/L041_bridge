@@ -1,0 +1,11 @@
+# Secrets — never commit
+.env
+.env.local
+*.pem
+
+# OS / tooling
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/

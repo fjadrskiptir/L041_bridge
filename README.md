@@ -231,8 +231,14 @@ Your **phone talks to Telegram’s servers**; **`loki_direct_webui.py` on your M
 - **`LOKI_TELEGRAM_QUOTA_TZ`**: IANA timezone for the daily reset (e.g. `America/Los_Angeles`). If unset, uses the machine’s local calendar date.
 - **`LOKI_TELEGRAM_QUOTA_PATH`**: override path for the quota JSON (default `memories/telegram_proactive_quota.json`).
 - **`LOKI_TELEGRAM_PROACTIVE_INSTRUCTIONS_PATH`**: optional file; otherwise **`memories/telegram_proactive_instructions.md`** is read if present. See `memories/telegram_proactive_instructions.example.md`.
+- **`LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL`**: default `0`. Set `1` to allow Telegram admin commands from allowed chat ids:
+  - **`/loki_status`**: process status (pid/uptime)
+  - **`/loki_restart`**: restart the running Web UI process
+  - **`/loki_stop`**: stop the running Web UI process
 
 **Privacy:** only chat ids in **`TELEGRAM_ALLOWED_CHAT_IDS`** get replies. Inbound Telegram turns do **not** trigger Mac TTS (so your speaker doesn’t read every phone message aloud).
+
+**Remote restart notes:** `/loki_restart` works while Loki is running and reachable on Telegram. If the process is fully down, Telegram commands cannot reach it; for true self-healing, run Loki under a macOS LaunchAgent with `KeepAlive`.
 
 ### Memory + DB paths
 - **`LOKI_MEMORY_DIR`**: default `memories`

@@ -679,6 +679,16 @@ class LokiWebUI:
   const holdBtn = document.getElementById('hold');
   const stopBtn = document.getElementById('stop');
 
+  async function fetchWithTimeout(url, options = {{}}, timeoutMs = 95000) {{
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {{
+      return await fetch(url, {{ ...options, signal: controller.signal }});
+    }} finally {{
+      clearTimeout(timer);
+    }}
+  }}
+
   function captureWebcamJpegDataUrl() {{
     if (!webcamVideo || !webcamVideo.srcObject) return null;
     const w = webcamVideo.videoWidth, h = webcamVideo.videoHeight;
@@ -742,7 +752,7 @@ class LokiWebUI:
       if (text) input.value = '';
       status.textContent = 'Thinking...';
       try {{
-        const r = await fetch('/api/send', {{
+        const r = await fetchWithTimeout('/api/send', {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
           body: JSON.stringify({{ text, image: dataUrl }})
@@ -751,6 +761,8 @@ class LokiWebUI:
         if (!r.ok) {{
           add('system', (d && d.error) ? d.error : ('Send failed: ' + r.status));
         }}
+      }} catch (e) {{
+        add('system', (e && e.name === 'AbortError') ? 'Request timed out while Loki was thinking. Please retry.' : ('Send failed: ' + e));
       }} finally {{
         sendInFlight = false;
         status.textContent = 'Idle';
@@ -814,7 +826,7 @@ class LokiWebUI:
     input.value = '';
     status.textContent = 'Thinking...';
     try {{
-      const r = await fetch('/api/send', {{
+      const r = await fetchWithTimeout('/api/send', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify({{text}})
@@ -823,6 +835,8 @@ class LokiWebUI:
       if (!r.ok) {{
         add('system', (d && d.error) ? d.error : ('Send failed: ' + r.status));
       }}
+    }} catch (e) {{
+      add('system', (e && e.name === 'AbortError') ? 'Request timed out while Loki was thinking. Please retry.' : ('Send failed: ' + e));
     }} finally {{
       sendInFlight = false;
       status.textContent = 'Idle';
@@ -1554,6 +1568,27 @@ class LokiWebUI:
 
         return self._run_model_turn(skip_tts=skip_tts)
 
+    def _run_tool_call_with_timeout(self, tool_name: str, args: Dict[str, Any], timeout_s: float = 45.0) -> str:
+        """
+        Guard tool execution so one stuck tool cannot freeze /api/send forever.
+        """
+        out: Dict[str, str] = {}
+
+        def _runner() -> None:
+            try:
+                out["result"] = ld.run_tool_call(self.tools, str(tool_name), args if isinstance(args, dict) else {})
+            except Exception as e:
+                out["error"] = str(e)
+
+        t = threading.Thread(target=_runner, name=f"tool-{tool_name}", daemon=True)
+        t.start()
+        t.join(timeout=max(1.0, float(timeout_s)))
+        if t.is_alive():
+            return f"[tool timeout] `{tool_name}` exceeded {timeout_s:.0f}s; continue without it."
+        if "error" in out:
+            return f"[tool error] `{tool_name}`: {out['error']}"
+        return out.get("result", "")
+
     def _run_model_turn(self, *, skip_tts: bool = False) -> str:
         ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
         resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
@@ -1578,7 +1613,7 @@ class LokiWebUI:
                     args = ld.json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
                 except Exception:
                     args = {}
-                result = ld.run_tool_call(self.tools, str(tool_name), args if isinstance(args, dict) else {})
+                result = self._run_tool_call_with_timeout(str(tool_name), args if isinstance(args, dict) else {})
 
                 if tool_name in {"screenshot_monitor_base64", "screenshot_all_monitors_base64", "screenshot_left_base64", "screenshot_right_base64"}:
                     img_urls = ld.extract_image_data_urls(result)

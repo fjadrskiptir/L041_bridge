@@ -18,6 +18,7 @@ import random
 import re
 import threading
 import time
+import sys
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -28,6 +29,7 @@ import requests
 import loki_direct as ld
 
 TELEGRAM_API = "https://api.telegram.org"
+_PROC_STARTED_TS = time.time()
 
 _quota_file_lock = threading.Lock()
 
@@ -196,6 +198,10 @@ def _reply_errors_enabled() -> bool:
     return os.getenv("LOKI_TELEGRAM_REPLY_ON_ERROR", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _remote_admin_enabled() -> bool:
+    return os.getenv("LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _local_hour() -> int:
     tzname = (os.getenv("LOKI_TELEGRAM_QUOTA_TZ") or "").strip()
     if tzname:
@@ -329,6 +335,33 @@ def _compose_proactive_message(xai: ld.XAIClient) -> str:
     return out
 
 
+def _schedule_process_restart(delay_s: float = 1.25) -> None:
+    """Replace current Python process with a fresh instance of the same command."""
+
+    def _do() -> None:
+        time.sleep(max(0.1, float(delay_s)))
+        try:
+            exe = sys.executable or "python3"
+            argv = [exe, *sys.argv]
+            print(f"[telegram] remote restart: execv {argv!r}", flush=True)
+            os.execv(exe, argv)
+        except Exception as e:
+            print(f"[telegram] remote restart failed: {e}", flush=True)
+
+    threading.Thread(target=_do, daemon=True, name="loki-telegram-restart").start()
+
+
+def _schedule_process_stop(delay_s: float = 0.8) -> None:
+    """Hard-exit process after a short delay."""
+
+    def _do() -> None:
+        time.sleep(max(0.1, float(delay_s)))
+        print("[telegram] remote stop requested; exiting process", flush=True)
+        os._exit(0)
+
+    threading.Thread(target=_do, daemon=True, name="loki-telegram-stop").start()
+
+
 def _poll_loop(ui: Any, token: str, allowed: List[int]) -> None:
     allowed_set = set(allowed)
     offset: Optional[int] = _read_poll_offset()
@@ -406,6 +439,43 @@ def _poll_loop(ui: Any, token: str, allowed: List[int]) -> None:
                         "Hi — I'm Loki. Messages here use the same session as your home Web UI (your Mac must be on "
                         "and loki_direct_webui.py running). Reply here anytime, including on cellular.",
                     )
+                    continue
+
+                if text.startswith("/loki_status"):
+                    uptime_s = max(0, int(time.time() - _PROC_STARTED_TS))
+                    send_telegram_message(
+                        token,
+                        cid_i,
+                        "Loki status:\n"
+                        f"- PID: {os.getpid()}\n"
+                        f"- Uptime: {uptime_s}s\n"
+                        f"- Remote control: {'on' if _remote_admin_enabled() else 'off'}\n"
+                        "- Commands: /loki_status, /loki_restart, /loki_stop",
+                    )
+                    continue
+
+                if text.startswith("/loki_restart"):
+                    if not _remote_admin_enabled():
+                        send_telegram_message(
+                            token,
+                            cid_i,
+                            "Remote control is disabled. Set LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL=1 in .env and restart Web UI.",
+                        )
+                        continue
+                    send_telegram_message(token, cid_i, "Restarting Loki Web UI process now...")
+                    _schedule_process_restart()
+                    continue
+
+                if text.startswith("/loki_stop"):
+                    if not _remote_admin_enabled():
+                        send_telegram_message(
+                            token,
+                            cid_i,
+                            "Remote control is disabled. Set LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL=1 in .env and restart Web UI.",
+                        )
+                        continue
+                    send_telegram_message(token, cid_i, "Stopping Loki Web UI process now.")
+                    _schedule_process_stop()
                     continue
 
                 print(f"[telegram] inbound chat_id={cid_i} text_len={len(text)}", flush=True)
