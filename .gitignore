@@ -31,3 +31,4 @@ loki_plugins/now.py
 
 # Personal device registry — copy devices.example.json → devices.json locally
 devices.json
+memories/persona/instructions.md
