@@ -28,3 +28,6 @@ memories/watch_test.txt
 
 # Optional: scratch plugin (remove this line if you want it in the repo)
 loki_plugins/now.py
+
+# Personal device registry — copy devices.example.json → devices.json locally
+devices.json

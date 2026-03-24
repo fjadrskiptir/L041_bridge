@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy this file to devices.json and customize (devices.json is gitignored).",
+  "_format": {
+    "short_name": "Name the model uses to target this device (keep it short, lowercase)",
+    "match_strings": "Substrings to match against the Buttplug/Intiface device name (case-insensitive)",
+    "capabilities": "Map of output type to physical description of what it does on THIS device",
+    "intensity_floor": "Minimum intensity for perceptible sensation (0.0 if device responds at all levels)",
+    "notes": "Extra context to help the model use the device well"
+  },
+  "devices": [
+    {
+      "short_name": "example",
+      "match_strings": ["ExampleDeviceName"],
+      "capabilities": {
+        "vibrate": "describe what vibrate does on this hardware"
+      },
+      "intensity_floor": 0.0,
+      "notes": "Optional usage notes."
+    }
+  ]
+}

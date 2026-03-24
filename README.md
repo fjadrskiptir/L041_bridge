@@ -169,6 +169,7 @@ Tools:
 
 Notes:
 - `buttplug==1.0.0` requires `await dev.run_output(...)` — Loki Direct implements this.
+- **`devices.json`** (optional registry for some bridges / notes): **not** committed—copy **`devices.example.json`** → **`devices.json`** and edit locally. Git only tracks the example.
 
 ---
 

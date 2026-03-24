@@ -16,9 +16,13 @@
 
 - It’s a list of **patterns** (paths / wildcards).
 - **Untracked** files that match are **hidden** from `git status` and won’t be added by mistake.
-- **Already tracked** files are **not** removed from Git by adding them to `.gitignore`—you’d need `git rm --cached <file>` once.
+- **Already tracked** files are **not** removed from Git by adding them to `.gitignore`** alone**—Git will **keep** showing your edits until you **stop tracking** once:
+  ```bash
+  git rm --cached path/to/file   # removes from GitHub history going forward; keeps the file on disk
+  ```
+  Then commit that change. After that, `.gitignore` prevents the file from being re-added.
 
-This repo ignores things like `.env`, local SQLite memory DB, and runtime files under `memories/` so they don’t end up on GitHub.
+This repo ignores things like `.env`, local SQLite memory DB, runtime files under `memories/`, and **`devices.json`** (use **`devices.example.json`** in the repo instead) so they don’t end up on GitHub.
 
 ## Neater commits (habits)
 
