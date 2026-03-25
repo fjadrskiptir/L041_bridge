@@ -233,7 +233,8 @@ Loki watcher will:
 Loki tries xAI embeddings, but will fall back to local hashing embeddings if you don’t have access.
 - **`XAI_EMBEDDING_MODEL`**: default `grok-embedding` (may not be available)
 - **`XAI_EMBEDDINGS_ENDPOINT`**: default `https://api.x.ai/v1/embeddings`
-- **`LOKI_RETRIEVAL_K`**: default `6`
+- **`LOKI_RETRIEVAL_K`**: default `6` (lower to `3` if retrieved snippets feel noisy)
+- **`LOKI_RETRIEVAL_CHUNK_MAX_CHARS`**: default `900` — truncates each retrieved chunk before it is injected under the user message (reduces “word soup” from huge ingested files)
 
 ### Web search
 - **`LOKI_WEB_SEARCH`**: `1` (on) / `0` — enable tool `web_search` (DuckDuckGo).
@@ -361,7 +362,14 @@ Notes:
 - **`LOKI_SAY_VOICE`**: macOS `say -v` name (e.g. `Daniel`)
 - **`LOKI_SAY_RATE`**: `say -r` words per minute (empty = system default)
 - **`LOKI_TTS_SETTINGS_PATH`**: JSON file for saved UI voice settings (default `memories/tts_settings.json`)
-- **`LOKI_TTS_ENGINE`**: `say` (default) or **`piper`** for local neural TTS
+- **`LOKI_TTS_ENGINE`**: `say` (default), **`piper`** (local neural), or **`elevenlabs`** (cloud)
+- **ElevenLabs** (optional cloud TTS):
+  - **`ELEVENLABS_API_KEY`**: required for `elevenlabs` engine (keep in `.env` only — never commit)
+  - **`ELEVENLABS_VOICE_ID`**: default voice id (overridden by Web UI / `tts_settings.json`)
+  - **`ELEVENLABS_MODEL_ID`**: e.g. `eleven_turbo_v2_5` (default), `eleven_multilingual_v2`, `eleven_flash_v2_5`
+  - **`ELEVENLABS_STABILITY`** / **`ELEVENLABS_SIMILARITY`** / **`ELEVENLABS_STYLE`**: `0..1` defaults `0.5` / `0.75` / `0`
+  - **`ELEVENLABS_USE_SPEAKER_BOOST`**: `1` (default) or `0`
+  - **`ELEVENLABS_OUTPUT_FORMAT`**: optional (default **`mp3_44100_32`**). If audio fails, try **`mp3_22050_32`** or leave unset for API default.
 - **`LOKI_PIPER_VOICE`**: Piper voice id (default `en_US-lessac-medium`) or path to a `.onnx` model file
 - **`LOKI_PIPER_DATA_DIR`**: folder where downloaded Piper voices live (default `memories/piper_voices`)
 - **`LOKI_PIPER_BINARY`**: legacy `piper` CLI path when using a raw `.onnx` file (default `piper`)
@@ -403,16 +411,17 @@ Security note: plugin generation executes code you’re generating. Keep this lo
 **Web UI (recommended)**  
 Open **“Voice & speech (how Loki sounds)”** on the chat page:
 - **Speak replies** — turn spoken answers on/off (independent of “Voice On” for the mic).
-- **TTS engine** — **macOS say** or **Piper** (local neural).
+- **TTS engine** — **macOS say**, **Piper** (local neural), or **ElevenLabs** (cloud; API key in `.env` only).
 - **macOS say**: **Voice** — every voice macOS exposes via `say -v ?` (try **Daniel**, **Tom**, **Fred** for US English male; **Samantha** / **Karen** for female; **Premium** voices need **System Settings → Siri & Spotlight → Siri Voice** downloads). **Speaking rate (WPM)** — slightly **slower** (e.g. 150–175) often sounds more natural than the default.
-- **Piper**: **tap a voice card** (refreshes from your voice folder), tune **Sound** sliders (pace, expression, clarity, volume, pauses, playback speed), or use **Advanced** for folder path / downloads. Settings auto-save shortly after you change them.
+- **Piper**: **tap a voice card** (refreshes from your voice folder), tune **Sound** sliders (pace, expression, clarity, volume, pauses), or use **Advanced** for folder path / downloads. **Playback speed** is shared with ElevenLabs (neural/cloud row).
+- **ElevenLabs**: paste **Voice ID** from [ElevenLabs → Voices](https://elevenlabs.io/app/voice-library), pick **model**, tune stability / similarity / style. Restart the Web UI after adding `ELEVENLABS_API_KEY` to `.env`.
 - **Save** writes **`memories/tts_settings.json`** so CLI and web share the same profile.
 
 **`.env` (defaults before first save)**  
 - **`LOKI_SAY_VOICE`** — e.g. `Daniel` (empty = system default)  
 - **`LOKI_SAY_RATE`** — words per minute for `say -r` (empty = system default)  
 - **`LOKI_TTS_SETTINGS_PATH`** — override JSON path (default `memories/tts_settings.json`)
-- **`LOKI_TTS_ENGINE=say`** or **`piper`**, plus **`LOKI_PIPER_*`** vars (see **Voice / TTS** above)
+- **`LOKI_TTS_ENGINE=say`**, **`piper`**, or **`elevenlabs`**, plus **`LOKI_PIPER_*`** / **`ELEVENLABS_*`** as needed
 
 **Piper setup (recommended path: Python package)**  
 1. In your venv: `pip install piper-tts` (or `pip install -r requirements-piper.txt`).  
@@ -431,9 +440,10 @@ Open **“Voice & speech (how Loki sounds)”** on the chat page:
 |--------|---------|--------|
 | **macOS `say` + Premium voice** | Good | Download enhanced voices in System Settings; pick them in the UI dropdown. |
 | **[Piper](https://github.com/OHF-Voice/piper1-gpl)** (wired in-repo) | Very good | Local neural TTS via `piper-tts` or legacy `piper` + `.onnx`. |
-| **Cloud APIs** (OpenAI TTS, ElevenLabs, etc.) | Best | Requires keys + network; can be added as a plugin later. |
+| **ElevenLabs** (wired in-repo) | Best | Set `ELEVENLABS_API_KEY` + Voice ID; network + billing per ElevenLabs. |
+| **Other cloud APIs** (OpenAI TTS, etc.) | Best | Not built-in; could be added similarly. |
 
-Recommendation: tune **`say`** first for zero setup; switch the UI (or `LOKI_TTS_ENGINE=piper`) for **Piper** when you want more natural local speech.
+Recommendation: tune **`say`** for zero setup; **Piper** for local neural; **ElevenLabs** when you want cloud-quality speech and accept API usage.
 
 ### STT (you speak to Loki)
 **Feasible.** Options:

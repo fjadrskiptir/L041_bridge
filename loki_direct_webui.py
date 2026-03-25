@@ -55,6 +55,12 @@ _TTS_REQUEST_KEYS = (
     "piper_volume",
     "piper_sentence_silence",
     "piper_playback_rate",
+    "elevenlabs_voice_id",
+    "elevenlabs_model_id",
+    "elevenlabs_stability",
+    "elevenlabs_similarity",
+    "elevenlabs_style",
+    "elevenlabs_use_speaker_boost",
 )
 
 
@@ -131,7 +137,20 @@ class LokiWebUI:
             piper_volume=float(_tts0["piper_volume"]),
             piper_sentence_silence=float(_tts0["piper_sentence_silence"]),
             piper_playback_rate=float(_tts0["piper_playback_rate"]),
+            elevenlabs_voice_id=str(_tts0.get("elevenlabs_voice_id") or ""),
+            elevenlabs_model_id=str(_tts0.get("elevenlabs_model_id") or "eleven_turbo_v2_5"),
+            elevenlabs_stability=float(_tts0.get("elevenlabs_stability", 0.5)),
+            elevenlabs_similarity=float(_tts0.get("elevenlabs_similarity", 0.75)),
+            elevenlabs_style=float(_tts0.get("elevenlabs_style", 0.0)),
+            elevenlabs_use_speaker_boost=bool(_tts0.get("elevenlabs_use_speaker_boost", True)),
             stt_task_fn=self._on_voice_transcript,
+        )
+        print(
+            "[webui] TTS from disk: "
+            f"engine={_tts0.get('tts_engine')!r} "
+            f"elevenlabs_voice_id={'set' if str(_tts0.get('elevenlabs_voice_id') or '').strip() else 'empty'} "
+            f"ELEVENLABS_API_KEY={'set' if ld._sanitize_env_secret(os.getenv('ELEVENLABS_API_KEY')) else 'missing'}",
+            flush=True,
         )
         # Do NOT start hotkey listener; this UI drives start/stop recording.
 
@@ -587,14 +606,15 @@ class LokiWebUI:
 
   <details id="ttsPanel">
     <summary>Voice &amp; speech (how L041 sounds)</summary>
-    <p class="small" style="margin:8px 0 0 0">Choose <b>macOS say</b> or local neural <b>Piper</b> (<code>pip install piper-tts</code>). Settings save to <code>memories/tts_settings.json</code>.</p>
+    <p class="small" style="margin:8px 0 0 0">Choose <b>macOS say</b>, local <b>Piper</b>, or cloud <b>ElevenLabs</b> (API key in <code>.env</code> only). Settings save to <code>memories/tts_settings.json</code>.</p>
     <div class="tts-row">
       <label><input type="checkbox" id="ttsSpeakReplies" checked/> Speak replies (audio when Loki answers)</label>
     </div>
     <div class="tts-row">
       <label style="flex:2">TTS engine<br/>
         <select id="ttsEngine">
-          <option value="piper">Piper (neural) — recommended</option>
+          <option value="piper">Piper (neural, local)</option>
+          <option value="elevenlabs">ElevenLabs (cloud)</option>
           <option value="say">macOS say</option>
         </select>
       </label>
@@ -658,11 +678,6 @@ class LokiWebUI:
         <input type="range" id="ttsPiperPause" min="0" max="0.8" step="0.05" value="0"/>
         <span class="piper-slider-val" id="ttsPiperPauseVal">0</span>
       </div>
-      <div class="piper-slider-row">
-        <label>Playback speed <span class="small" style="font-weight:normal;color:#666">(how fast audio plays — macOS only)</span></label>
-        <input type="range" id="ttsPiperPlaySpeed" min="0.75" max="1.25" step="0.05" value="1"/>
-        <span class="piper-slider-val" id="ttsPiperPlaySpeedVal">1</span>
-      </div>
       <div class="tts-row">
         <button type="button" id="ttsPiperResetSound">Reset sound sliders to defaults</button>
       </div>
@@ -696,6 +711,52 @@ class LokiWebUI:
           <p class="small" style="margin:8px 0 0 0">Samples: <a href="https://rhasspy.github.io/piper-samples" target="_blank" rel="noopener">rhasspy.github.io/piper-samples</a></p>
         </details>
       </details>
+    </div>
+    <div id="elevenlabsBlock" style="display:none">
+      <p class="small" style="margin:0 0 8px 0;line-height:1.45">
+        Put <code>ELEVENLABS_API_KEY</code> in <code>.env</code> (never pasted in the browser). Copy a <b>Voice ID</b> from
+        <a href="https://elevenlabs.io/app/voice-library" target="_blank" rel="noopener">ElevenLabs → Voices</a>.
+      </p>
+      <p class="small" id="ttsElevenKeyHint" style="margin:0 0 8px 0"></p>
+      <div class="tts-row">
+        <label style="flex:2">Voice ID<br/>
+          <input type="text" id="ttsElevenVoiceId" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2b303b;background:#11161d;color:#f3f5f7" placeholder="e.g. 21m00Tcm4TlvDq8ikWAM"/>
+        </label>
+      </div>
+      <div class="tts-row">
+        <label style="flex:2">Model<br/>
+          <select id="ttsElevenModel" style="width:100%;max-width:420px;padding:8px;border-radius:8px;border:1px solid #2b303b;background:#11161d;color:#f3f5f7">
+            <option value="eleven_turbo_v2_5">eleven_turbo_v2_5 (fast, good)</option>
+            <option value="eleven_multilingual_v2">eleven_multilingual_v2</option>
+            <option value="eleven_flash_v2_5">eleven_flash_v2_5 (fastest)</option>
+          </select>
+        </label>
+      </div>
+      <div class="piper-slider-row">
+        <label>Stability</label>
+        <input type="range" id="ttsElevenStability" min="0" max="1" step="0.05" value="0.5"/>
+        <span class="piper-slider-val" id="ttsElevenStabilityVal">0.5</span>
+      </div>
+      <div class="piper-slider-row">
+        <label>Similarity</label>
+        <input type="range" id="ttsElevenSimilarity" min="0" max="1" step="0.05" value="0.75"/>
+        <span class="piper-slider-val" id="ttsElevenSimilarityVal">0.75</span>
+      </div>
+      <div class="piper-slider-row">
+        <label>Style exaggeration</label>
+        <input type="range" id="ttsElevenStyle" min="0" max="1" step="0.05" value="0"/>
+        <span class="piper-slider-val" id="ttsElevenStyleVal">0</span>
+      </div>
+      <div class="tts-row">
+        <label><input type="checkbox" id="ttsElevenBoost" checked/> Speaker boost</label>
+      </div>
+    </div>
+    <div id="ttsNeuralPlaybackRow" style="display:none">
+      <div class="piper-slider-row">
+        <label>Playback speed <span class="small" style="font-weight:normal;color:#666">(Piper WAV / ElevenLabs MP3 via <code>afplay</code>)</span></label>
+        <input type="range" id="ttsPiperPlaySpeed" min="0.75" max="1.25" step="0.05" value="1"/>
+        <span class="piper-slider-val" id="ttsPiperPlaySpeedVal">1</span>
+      </div>
     </div>
     <div class="tts-actions">
       <button type="button" id="ttsSave">Save voice settings</button>
@@ -1069,6 +1130,18 @@ class LokiWebUI:
   const ttsSave = document.getElementById('ttsSave');
   const ttsTest = document.getElementById('ttsTest');
   const ttsHint = document.getElementById('ttsHint');
+  const elevenlabsBlock = document.getElementById('elevenlabsBlock');
+  const ttsNeuralPlaybackRow = document.getElementById('ttsNeuralPlaybackRow');
+  const ttsElevenVoiceId = document.getElementById('ttsElevenVoiceId');
+  const ttsElevenModel = document.getElementById('ttsElevenModel');
+  const ttsElevenStability = document.getElementById('ttsElevenStability');
+  const ttsElevenStabilityVal = document.getElementById('ttsElevenStabilityVal');
+  const ttsElevenSimilarity = document.getElementById('ttsElevenSimilarity');
+  const ttsElevenSimilarityVal = document.getElementById('ttsElevenSimilarityVal');
+  const ttsElevenStyle = document.getElementById('ttsElevenStyle');
+  const ttsElevenStyleVal = document.getElementById('ttsElevenStyleVal');
+  const ttsElevenBoost = document.getElementById('ttsElevenBoost');
+  const ttsElevenKeyHint = document.getElementById('ttsElevenKeyHint');
   const ttsNoStore = {{ cache: 'no-store' }};
 
   let ttsSaveTimer = null;
@@ -1092,6 +1165,12 @@ class LokiWebUI:
   bindPiperSlider(ttsPiperVol, ttsPiperVolVal, 2);
   bindPiperSlider(ttsPiperPause, ttsPiperPauseVal, 2);
   bindPiperSlider(ttsPiperPlaySpeed, ttsPiperPlaySpeedVal, 2);
+  if (ttsElevenStability && ttsElevenStabilityVal) bindPiperSlider(ttsElevenStability, ttsElevenStabilityVal, 2);
+  if (ttsElevenSimilarity && ttsElevenSimilarityVal) bindPiperSlider(ttsElevenSimilarity, ttsElevenSimilarityVal, 2);
+  if (ttsElevenStyle && ttsElevenStyleVal) bindPiperSlider(ttsElevenStyle, ttsElevenStyleVal, 2);
+  if (ttsElevenVoiceId) ttsElevenVoiceId.addEventListener('input', scheduleTtsSave);
+  if (ttsElevenModel) ttsElevenModel.addEventListener('change', scheduleTtsSave);
+  if (ttsElevenBoost) ttsElevenBoost.addEventListener('change', scheduleTtsSave);
 
   ttsPiperResetSound.onclick = () => {{
     ttsPiperPace.value = '1';
@@ -1124,7 +1203,7 @@ class LokiWebUI:
   async function applyTtsFormFromServer(sd, hintText) {{
     if (!sd || sd.ok === false) return false;
     ttsSpeakReplies.checked = !!sd.tts_enable;
-    ttsEngine.value = (sd.tts_engine === 'piper') ? 'piper' : 'say';
+    ttsEngine.value = (sd.tts_engine === 'piper') ? 'piper' : (sd.tts_engine === 'elevenlabs') ? 'elevenlabs' : 'say';
     refreshTtsEngineUi();
     ttsVoice.value = sd.say_voice || '';
     if (sd.say_rate_wpm == null || sd.say_rate_wpm === '') {{
@@ -1140,6 +1219,32 @@ class LokiWebUI:
     ttsPiperBinary.value = sd.piper_binary || '';
     ttsPiperSpeaker.value = (sd.piper_speaker_id != null && sd.piper_speaker_id !== '') ? String(sd.piper_speaker_id) : '';
     setPiperSliderFromServer(sd);
+    if (ttsElevenVoiceId) ttsElevenVoiceId.value = sd.elevenlabs_voice_id || '';
+    if (ttsElevenModel) {{
+      const mid = (sd.elevenlabs_model_id || 'eleven_turbo_v2_5').trim();
+      const opt = Array.from(ttsElevenModel.options).some((o) => o.value === mid);
+      ttsElevenModel.value = opt ? mid : 'eleven_turbo_v2_5';
+    }}
+    function setElSlider(id, valEl, key, def) {{
+      const el = document.getElementById(id);
+      const ve = document.getElementById(valEl);
+      if (!el) return;
+      let n = (sd[key] != null && sd[key] !== '') ? parseFloat(sd[key]) : def;
+      if (isNaN(n)) n = def;
+      el.value = String(n);
+      el.dispatchEvent(new Event('input'));
+      if (ve) ve.textContent = Number(n).toFixed(2);
+    }}
+    setElSlider('ttsElevenStability', 'ttsElevenStabilityVal', 'elevenlabs_stability', 0.5);
+    setElSlider('ttsElevenSimilarity', 'ttsElevenSimilarityVal', 'elevenlabs_similarity', 0.75);
+    setElSlider('ttsElevenStyle', 'ttsElevenStyleVal', 'elevenlabs_style', 0);
+    if (ttsElevenBoost) ttsElevenBoost.checked = sd.elevenlabs_use_speaker_boost !== false;
+    if (ttsElevenKeyHint) {{
+      ttsElevenKeyHint.style.color = sd.elevenlabs_api_key_configured ? '#7dcea0' : '#f0b27a';
+      ttsElevenKeyHint.textContent = sd.elevenlabs_api_key_configured
+        ? 'ELEVENLABS_API_KEY is set in .env ✓'
+        : 'Add ELEVENLABS_API_KEY to .env and restart the Web UI.';
+    }}
     if (hintText !== undefined && hintText !== null) {{
       ttsHint.textContent = hintText;
     }} else if (sd.settings_path) {{
@@ -1256,9 +1361,13 @@ class LokiWebUI:
   ttsPiperRefreshVoices.onclick = () => {{ refreshPiperInstalledVoices(); }};
 
   function refreshTtsEngineUi() {{
-    const p = ttsEngine.value === 'piper';
-    sayBlock.style.display = p ? 'none' : 'block';
-    piperBlock.style.display = p ? 'block' : 'none';
+    const eng = ttsEngine.value;
+    const isPiper = eng === 'piper';
+    const isEl = eng === 'elevenlabs';
+    sayBlock.style.display = (eng === 'say') ? 'block' : 'none';
+    piperBlock.style.display = isPiper ? 'block' : 'none';
+    if (elevenlabsBlock) elevenlabsBlock.style.display = isEl ? 'block' : 'none';
+    if (ttsNeuralPlaybackRow) ttsNeuralPlaybackRow.style.display = (isPiper || isEl) ? 'block' : 'none';
   }}
 
   function syncTtsRateDisabled() {{
@@ -1325,7 +1434,13 @@ class LokiWebUI:
       piper_volume: parseSliderFloat(ttsPiperVol, 1.0),
       piper_sentence_silence: Number.isFinite(pauseRaw) ? pauseRaw : 0.0,
       piper_playback_rate: parseSliderFloat(ttsPiperPlaySpeed, 1.0),
-      piper_speaker_id: spkOut
+      piper_speaker_id: spkOut,
+      elevenlabs_voice_id: (ttsElevenVoiceId && ttsElevenVoiceId.value) ? ttsElevenVoiceId.value.trim() : '',
+      elevenlabs_model_id: (ttsElevenModel && ttsElevenModel.value) ? ttsElevenModel.value : 'eleven_turbo_v2_5',
+      elevenlabs_stability: ttsElevenStability ? parseSliderFloat(ttsElevenStability, 0.5) : 0.5,
+      elevenlabs_similarity: ttsElevenSimilarity ? parseSliderFloat(ttsElevenSimilarity, 0.75) : 0.75,
+      elevenlabs_style: ttsElevenStyle ? parseSliderFloat(ttsElevenStyle, 0) : 0,
+      elevenlabs_use_speaker_boost: !!(ttsElevenBoost && ttsElevenBoost.checked)
     }};
   }}
 
@@ -1479,10 +1594,7 @@ class LokiWebUI:
             qemb = ld.embed_texts(self.xai, [r_query])[0]
             hits = self.vstore.search(qemb, k=ld.RETRIEVAL_K)
             if hits:
-                parts = []
-                for h in hits:
-                    parts.append(f"- score={h['score']:.3f} source={h['source_path']} chunk={h['chunk_index']}\n{h['text']}")
-                retrieved_block = "Retrieved memory:\n" + "\n\n".join(parts)
+                retrieved_block = ld.format_retrieved_memory_block(hits)
         except Exception:
             retrieved_block = ""
 
@@ -1628,10 +1740,7 @@ class LokiWebUI:
             qemb = ld.embed_texts(self.xai, [user_in])[0]
             hits = self.vstore.search(qemb, k=ld.RETRIEVAL_K)
             if hits:
-                parts = []
-                for h in hits:
-                    parts.append(f"- score={h['score']:.3f} source={h['source_path']} chunk={h['chunk_index']}\n{h['text']}")
-                retrieved_block = "Retrieved memory:\n" + "\n\n".join(parts)
+                retrieved_block = ld.format_retrieved_memory_block(hits)
         except Exception:
             retrieved_block = ""
 

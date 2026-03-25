@@ -170,6 +170,12 @@ class LokiGUI(tk.Tk):
             piper_volume=float(_tts0["piper_volume"]),
             piper_sentence_silence=float(_tts0["piper_sentence_silence"]),
             piper_playback_rate=float(_tts0["piper_playback_rate"]),
+            elevenlabs_voice_id=str(_tts0.get("elevenlabs_voice_id") or ""),
+            elevenlabs_model_id=str(_tts0.get("elevenlabs_model_id") or "eleven_turbo_v2_5"),
+            elevenlabs_stability=float(_tts0.get("elevenlabs_stability", 0.5)),
+            elevenlabs_similarity=float(_tts0.get("elevenlabs_similarity", 0.75)),
+            elevenlabs_style=float(_tts0.get("elevenlabs_style", 0.0)),
+            elevenlabs_use_speaker_boost=bool(_tts0.get("elevenlabs_use_speaker_boost", True)),
             stt_task_fn=lambda transcript: self._dispatch_voice_transcript(transcript),
         )
 
@@ -413,10 +419,7 @@ class LokiGUI(tk.Tk):
             qemb = ld.embed_texts(self.xai, [user_in])[0]
             hits = self.vstore.search(qemb, k=ld.RETRIEVAL_K)
             if hits:
-                parts = []
-                for h in hits:
-                    parts.append(f"- score={h['score']:.3f} source={h['source_path']} chunk={h['chunk_index']}\n{h['text']}")
-                retrieved_block = "Retrieved memory:\n" + "\n\n".join(parts)
+                retrieved_block = ld.format_retrieved_memory_block(hits)
                 self.messages[-1]["content"] = f"{user_in}\n\n---\n{retrieved_block}"
         except Exception:
             pass
