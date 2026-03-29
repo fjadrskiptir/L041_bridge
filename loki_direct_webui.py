@@ -89,13 +89,13 @@ class LokiWebUI:
         ld.ensure_persona_template()
         self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
 
-        self.tools = ld.build_core_tools(self.butt, self.screen)
+        self.xai = ld.XAIClient(ld.XAI_API_KEY, ld.XAI_ENDPOINT, ld.XAI_MODEL, timeout_s=ld.REQUEST_TIMEOUT_S)
+        self.vstore = ld.VectorMemoryStore(ld.VECTOR_DB_PATH)
+
+        self.tools = ld.build_core_tools(self.butt, self.screen, self.xai)
         ld.ensure_plugins_package(ld.PLUGINS_DIR)
         for msg in ld.load_plugins(ld.PLUGINS_DIR, self.tools):
             self.ui_events.put({"role": "system", "text": f"[plugin] {msg}"})
-
-        self.xai = ld.XAIClient(ld.XAI_API_KEY, ld.XAI_ENDPOINT, ld.XAI_MODEL, timeout_s=ld.REQUEST_TIMEOUT_S)
-        self.vstore = ld.VectorMemoryStore(ld.VECTOR_DB_PATH)
 
         self.watcher: Optional[ld.MemoryFolderWatcher] = None
         if ld.WATCH_MEMORY_FOLDER:
@@ -1628,7 +1628,7 @@ class LokiWebUI:
 
         if user_in == "/help":
             return (
-                "Commands: /tools, /scan, /mem, /persona, /attach <path>, /ingest <path>, /compile_mem, "
+                "Commands: /tools, /scan, /mem, /persona, /voice_style, /attach <path>, /ingest <path>, /compile_mem, "
                 "/set_screen left <i>, /autodetect_screens, /upgrade <req> — time: get_current_time; "
                 "macOS Calendar: apple_calendar_* tools. Web UI: **Camera on** + **Send with camera** for webcam. "
                 "Telegram: same session if LOKI_TELEGRAM=1."
@@ -1644,7 +1644,8 @@ class LokiWebUI:
             self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
             ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
             return (
-                f"[memory] Reloaded {ld.MEMORY_DIR} + persona ({ld.PERSONA_INSTRUCTIONS_PATH.name}). "
+                f"[memory] Reloaded {ld.MEMORY_DIR} + persona ({ld.PERSONA_INSTRUCTIONS_PATH.name}) "
+                f"+ spoken style ({ld.SPOKEN_STYLE_PATH.name}). "
                 f"Path: {ld.PERSONA_INSTRUCTIONS_PATH}"
             )
 
@@ -1654,6 +1655,15 @@ class LokiWebUI:
             return (
                 f"[persona] Instructions file:\n{ld.PERSONA_INSTRUCTIONS_PATH}\n"
                 f"[persona] Current length: {n} characters (max {ld.PERSONA_INSTRUCTIONS_MAX_CHARS}). "
+                "Run **/mem** after editing on disk to refresh the system prompt."
+            )
+
+        if user_in == "/voice_style":
+            ld.ensure_persona_template()
+            n = len(ld.load_spoken_style_instructions())
+            return (
+                f"[voice_style] File:\n{ld.SPOKEN_STYLE_PATH}\n"
+                f"[voice_style] Current length: {n} characters (max {ld.SPOKEN_STYLE_MAX_CHARS}). "
                 "Run **/mem** after editing on disk to refresh the system prompt."
             )
 
@@ -1799,6 +1809,8 @@ class LokiWebUI:
                 timeout_s = 45.0
                 if str(tool_name) == "submit_art_generation":
                     timeout_s = max(45.0, float(ld.LOKI_ART_WEBHOOK_TIMEOUT_S) + 30.0)
+                elif str(tool_name) == "read_memory_file":
+                    timeout_s = 120.0
                 result = self._run_tool_call_with_timeout(
                     str(tool_name), args if isinstance(args, dict) else {}, timeout_s=timeout_s
                 )
@@ -1838,9 +1850,7 @@ class LokiWebUI:
             resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
             msg = ld.extract_assistant_message(resp)
 
-        content = msg.get("content") or ""
-        if isinstance(content, list):
-            content = "\n".join([p.get("text", "") for p in content if isinstance(p, dict)])
+        content = ld.normalize_assistant_reply_text(msg.get("content") or "")
 
         self.messages.append({"role": "assistant", "content": content})
 

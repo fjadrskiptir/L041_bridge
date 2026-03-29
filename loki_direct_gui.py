@@ -49,14 +49,14 @@ class LokiGUI(tk.Tk):
         ld.ensure_persona_template()
         self.memory_text, _mem_warnings = ld.load_memories(ld.MEMORY_DIR)
 
+        self.xai = ld.XAIClient(ld.XAI_API_KEY, ld.XAI_ENDPOINT, ld.XAI_MODEL, timeout_s=ld.REQUEST_TIMEOUT_S)
+        self.vstore = ld.VectorMemoryStore(ld.VECTOR_DB_PATH)
+
         # Tools + plugins
-        self.tools = ld.build_core_tools(self.butt, self.screen)
+        self.tools = ld.build_core_tools(self.butt, self.screen, self.xai)
         ld.ensure_plugins_package(ld.PLUGINS_DIR)
         for msg in ld.load_plugins(ld.PLUGINS_DIR, self.tools):
             self._ui_append("system", f"[plugin] {msg}")
-
-        self.xai = ld.XAIClient(ld.XAI_API_KEY, ld.XAI_ENDPOINT, ld.XAI_MODEL, timeout_s=ld.REQUEST_TIMEOUT_S)
-        self.vstore = ld.VectorMemoryStore(ld.VECTOR_DB_PATH)
 
         self.watcher: Optional[ld.MemoryFolderWatcher] = None
         if ld.WATCH_MEMORY_FOLDER:
@@ -275,7 +275,7 @@ class LokiGUI(tk.Tk):
         if user_in == "/help":
             self._ui_append(
                 "system",
-                "Commands: /tools, /scan, /mem, /persona, /attach <path>, /ingest <path>, /compile_mem, /set_screen left <i>, /autodetect_screens, /upgrade <req>",
+                "Commands: /tools, /scan, /mem, /persona, /voice_style, /attach <path>, /ingest <path>, /compile_mem, /set_screen left <i>, /autodetect_screens, /upgrade <req>",
             )
             return
         if user_in == "/tools":
@@ -289,7 +289,7 @@ class LokiGUI(tk.Tk):
             self._refresh_system_prompt()
             self._ui_append(
                 "system",
-                f"[memory] Reloaded {ld.MEMORY_DIR} + persona ({ld.PERSONA_INSTRUCTIONS_PATH.name})",
+                f"[memory] Reloaded {ld.MEMORY_DIR} + persona ({ld.PERSONA_INSTRUCTIONS_PATH.name}) + spoken style ({ld.SPOKEN_STYLE_PATH.name})",
             )
             return
 
@@ -299,6 +299,15 @@ class LokiGUI(tk.Tk):
             self._ui_append(
                 "system",
                 f"[persona] {ld.PERSONA_INSTRUCTIONS_PATH}\n({n} chars, max {ld.PERSONA_INSTRUCTIONS_MAX_CHARS}) — /mem to refresh after edits.",
+            )
+            return
+
+        if user_in == "/voice_style":
+            ld.ensure_persona_template()
+            n = len(ld.load_spoken_style_instructions())
+            self._ui_append(
+                "system",
+                f"[voice_style] {ld.SPOKEN_STYLE_PATH}\n({n} chars, max {ld.SPOKEN_STYLE_MAX_CHARS}) — /mem to refresh after edits.",
             )
             return
 
@@ -489,9 +498,7 @@ class LokiGUI(tk.Tk):
             resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
             msg = ld.extract_assistant_message(resp)
 
-        content = msg.get("content") or ""
-        if isinstance(content, list):
-            content = "\n".join([p.get("text", "") for p in content if isinstance(p, dict)])
+        content = ld.normalize_assistant_reply_text(msg.get("content") or "")
 
         last_user_plain = ""
         if self.messages and self.messages[-1].get("role") == "user":

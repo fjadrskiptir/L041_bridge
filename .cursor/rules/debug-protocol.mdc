@@ -1,0 +1,35 @@
+---
+description: Debug-only — reproduce first, minimal diffs; use in a dedicated chat (not feature upgrades)
+alwaysApply: false
+---
+
+# Debug protocol (Loki / l041_bridge)
+
+Use this rule when the goal is **fix a breakage or incorrect behavior**, not new features or refactors.
+
+## Scope
+
+- **In scope:** Root cause, smallest patch, logging only if it helps diagnose or prevent repeat failures.
+- **Out of scope:** Upgrades, new UX, broad refactors, README/feature docs unless required to fix the bug.
+
+## Process
+
+1. **Reproduce** — Confirm steps, env (OS, how you launch: `Start_Loki.command`, web UI, GUI), and exact error text or traceback.
+2. **Locate** — Find the code path (grep, stack trace); read surrounding code before editing.
+3. **Fix** — One clear cause → one clear change. Prefer reusing existing helpers and patterns in this repo.
+4. **Verify** — Run the smallest check that proves the fix (script, curl, manual step the user can repeat).
+
+## Code style
+
+- Match naming, imports, and structure of the file you touch.
+- Do not remove unrelated comments or “clean up” files you were not asked to change.
+
+## Communication
+
+- Write like a clear technical note: full sentences, precise terms, no filler or engagement bait.
+- Prefer code citations (`startLine:endLine:path`) when pointing at existing code.
+- Never commit or echo secrets (`.env`, API keys); `.env` is gitignored for a reason.
+
+## Handoff
+
+If the user pasted a block from `AGENTS.md` (“Debug handoff”), treat it as authoritative context and ask only what is missing to reproduce.

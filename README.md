@@ -11,6 +11,7 @@ Run a local “Grok companion” that can:
 - **Dropbox-style memory inbox**: drop files into `memories/inbox/` and Loki auto-processes + recalls them later.
 - **Self-upgrade via plugins**: ask “add X” and Loki can generate a plugin file in `loki_plugins/`.
 - **Authoritative time**: every model call includes **Unix epoch + ISO 8601** local/UTC in the system prompt; tool **`get_current_time`** for explicit checks.
+- **Lunar calendar** (optional env): moon phase + upcoming **lunar/solar eclipses** for a **Puerto Rico–centric default observer** (override with `LOKI_LUNAR_*`); tool **`get_lunar_calendar`**.
 - **Apple Calendar (macOS)**: read/create/update/delete events in **Calendar.app** via automation tools (optional).
 - **Local art / image stack (optional)**: when **`LOKI_ART_WEBHOOK_URL`** is set, Loki gets tool **`submit_art_generation`** to POST prompts to *your* separate generator (ComfyUI bridge, A1111 API, custom server, etc.).
 
@@ -28,8 +29,10 @@ This repo is evolving toward a fully local AI companion loop: perception (screen
 ### Install deps (venv)
 
 ```bash
-./venv/bin/python -m pip install -U requests python-dotenv pyautogui buttplug pypdf duckduckgo-search
+./venv/bin/python -m pip install -U requests python-dotenv pyautogui buttplug pypdf duckduckgo-search ephem
 ```
+
+(`ephem` improves lunar rise/set and next-phase times; Loki runs without it using a built-in phase approximation.)
 
 (`duckduckgo-search` powers the **`web_search`** tool for research; Loki runs without it but will tell you to install if you ask him to search.)
 
@@ -177,7 +180,10 @@ Notes:
 
 There are three related layers:
 
-- **Personality (`memories/persona/instructions.md`)**: centralized markdown for how Loki **writes**, **behaves**, and **speaks in text** (tone, cadence, boundaries). Injected into the **system prompt** every reply. The **`memories/persona/`** tree is **excluded** from the generic snapshot below so it is not duplicated. **Web UI:** open **Personality & instructions** → edit → **Save & apply**. **Chat:** `/persona` (path + size), `/mem` (reload from disk). **From chat, Loki can edit it** using tools **`read_persona_instructions`** and **`update_persona_instructions`** (`mode`: `replace` for a full rewrite, `append` to add at the end); changes are saved to disk and the live session system prompt is refreshed automatically in Web UI / GUI / CLI.
+- **Persona bundle (`memories/persona/`)** — see **`memories/persona/README.md`** for layout.
+  - **`instructions.md`**: character, relationship, lore rules, silence/return behavior, Grok-parity cues. Injected every reply; **gitignored** when private. **Template:** copy from **`instructions.example.md`** (repo, AI-oriented wording) then customize section **8. User-specific anchors**.
+  - **`spoken_voice.md`**: TTS + chat *delivery* (cadence, British/deep register cues, anti-repetition, anti-bot). Injected every reply.
+  - **Web UI:** **Personality & instructions** → edit → **Save & apply**. **Chat:** `/persona`, `/voice_style`, `/mem`. **Tools:** `read_persona_instructions`, `update_persona_instructions`, `read_spoken_style_instructions`, `update_spoken_style_instructions`.
 
 ### Brave Leo (custom model) + shared memory with home Loki
 
@@ -198,7 +204,7 @@ The **Web UI** exposes an **OpenAI-compatible** surface on the **same port** as 
 6. **System prompt in Brave:** you can mirror **`memories/persona/instructions.md`** there for Leo’s tone; the **shared log** is separate and automatic.
 
 **Env toggles:** `LOKI_CROSS_CHAT_LOG`, `LOKI_CROSS_CHAT_LOG_PATH`, `LOKI_CROSS_CHAT_PROMPT_MAX_CHARS`, `LOKI_CROSS_CHAT_APPEND_HOME`, `LOKI_BRAVE_LEO_INJECT_SYNC`, `LOKI_LEO_BRIDGE_API_KEY`.
-- **Snapshot memory (`/mem`)**: loads other text files from `memories/` (recursive) into the system prompt.
+- **Snapshot memory (`/mem`)**: loads text files from `memories/` (recursive) into the system prompt and lists image paths **without pixels** (so the model is not tempted to guess). Loki opens any file under `memories/` via the **`read_memory_file`** tool: vision for images, raw text for markdown/json, PDF text via `pypdf`. CLI users can still use **`/attach`** with an absolute path.
 - **Vector memory (SQLite)**: ingests files into `loki_memory.sqlite3` for semantic recall on every user message.
 
 ### Supported memory file types
@@ -332,6 +338,7 @@ Notes:
 - **`LOKI_MEMORY_DIR`**: default `memories`
 - **`LOKI_PERSONA_DIR`**: default `memories/persona`
 - **`LOKI_PERSONA_INSTRUCTIONS_PATH`**: default `memories/persona/instructions.md`
+- **`LOKI_SPOKEN_STYLE_PATH`**: default `memories/persona/spoken_voice.md`
 - **`LOKI_PERSONA_INSTRUCTIONS_MAX_CHARS`**: default `48000`
 - **`LOKI_INBOX_DIR`**: default `memories/inbox`
 - **`LOKI_PROCESSED_DIR`**: default `memories/processed`
@@ -352,6 +359,16 @@ Notes:
 - **`LOKI_TIME_SYSTEM_PROMPT`**: `1` (on) / `0` (off) — inject epoch + ISO clock block every model call
 - **`LOKI_TIMEZONE`**: optional IANA timezone for consistent local-date reasoning.  
   Puerto Rico (no DST): **`America/Puerto_Rico`**
+
+### Lunar calendar & eclipses (authoritative prompt block)
+Injected on every model call when **`LOKI_LUNAR_CONTEXT`** is on (default). Ground truth for moon phase and a small **on-disk eclipse catalog** (UTC max times + Puerto Rico–oriented notes), so Loki does not have to invent phases or eclipse dates.
+
+- **`LOKI_LUNAR_CONTEXT`**: `1` (on) / `0` (off)
+- **`LOKI_LUNAR_TIMEZONE`**: IANA zone for local labels (defaults to **`LOKI_TIMEZONE`** or **`America/Puerto_Rico`**)
+- **`LOKI_LUNAR_LAT`** / **`LOKI_LUNAR_LON`**: observer coordinates (defaults **~San Juan**: `18.4655`, `-66.1057`)
+- **Optional**: `pip install ephem` — more accurate **moon altitude**, **next new/full/quarter** times (PyEphem). Without it, phase still works via an approximate model + install hint in the prompt.
+
+Tool **`get_lunar_calendar`** returns the same data as JSON. For maps/obscuration details, `web_search` / NASA eclipse pages still help.
 
 ### Apple Calendar (macOS only)
 - **`LOKI_APPLE_CALENDAR`**: `1` (on) / `0` (off)
