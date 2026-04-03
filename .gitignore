@@ -36,3 +36,8 @@ loki_plugins/now.py
 devices.json
 memories/persona/instructions.md
 memories/persona/user_facts.md
+memories/persona/telegram_style.example.md
+memories/persona/spoken_voice.md
+memories/persona/instructions.example.md
+loki_lunar_context.py
+loki_chat_threads.py
