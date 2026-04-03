@@ -1,21 +1,31 @@
 {
-  "_comment": "Copy this file to devices.json and customize (devices.json is gitignored).",
+  "_comment": "Copy to devices.json (repo root, gitignored). First device is the default active profile unless INTIFACE_ACTIVE_DEVICE is set in .env.",
   "_format": {
-    "short_name": "Name the model uses to target this device (keep it short, lowercase)",
-    "match_strings": "Substrings to match against the Buttplug/Intiface device name (case-insensitive)",
-    "capabilities": "Map of output type to physical description of what it does on THIS device",
-    "intensity_floor": "Minimum intensity for perceptible sensation (0.0 if device responds at all levels)",
-    "notes": "Extra context to help the model use the device well"
+    "short_name": "Lowercase alias (e.g. tenera, nora)",
+    "match_strings": "Substrings tried in order against the Intiface device name (case-insensitive)",
+    "capabilities": "Optional map describing vibrate / rotate / etc. on this hardware",
+    "intensity_floor": "Minimum intensity that usually feels clear (0.0 if unknown)",
+    "notes": "Optional hints for the model"
   },
   "devices": [
     {
-      "short_name": "example",
-      "match_strings": ["ExampleDeviceName"],
+      "short_name": "tenera",
+      "match_strings": ["Tenera", "tenera"],
       "capabilities": {
-        "vibrate": "describe what vibrate does on this hardware"
+        "vibrate": "Lovense Tenera — vibration as exposed by Buttplug/Intiface for this model."
       },
-      "intensity_floor": 0.0,
-      "notes": "Optional usage notes."
+      "intensity_floor": 0.1,
+      "notes": "Adjust match_strings to match list_devices exactly if needed."
+    },
+    {
+      "short_name": "nora",
+      "match_strings": ["nora"],
+      "capabilities": {
+        "vibrate": "Lovense Nora: shaft + external arm vibration.",
+        "rotate": "Internal rotating / G-spot pressure where supported."
+      },
+      "intensity_floor": 0.15,
+      "notes": "Intiface name is usually like “Lovense Nora”."
     }
   ]
 }

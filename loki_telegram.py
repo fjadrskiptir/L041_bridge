@@ -7,7 +7,9 @@ Requirements:
   TELEGRAM_BOT_TOKEN       — from @BotFather
   TELEGRAM_ALLOWED_CHAT_IDS — comma-separated numeric ids (your user id)
 
-Inbound messages use the same chat session as the browser. Outbound "thinking of you"
+Inbound messages use a dedicated persisted thread (see LOKI_TELEGRAM_THREAD_ID in README).
+Cross-space continuity still feeds other spaces into the system prompt when enabled.
+Outbound "thinking of you"
 pings are capped per local day (see LOKI_TELEGRAM_PROACTIVE_PER_DAY).
 """
 
@@ -34,6 +36,148 @@ TELEGRAM_API = "https://api.telegram.org"
 _PROC_STARTED_TS = time.time()
 
 _quota_file_lock = threading.Lock()
+_telegram_lock_file_lock = threading.Lock()
+_seen_updates_file_lock = threading.Lock()
+
+
+def _seen_updates_path() -> Path:
+    return Path(os.getenv("LOKI_TELEGRAM_SEEN_UPDATES_PATH", str(ld.MEMORY_DIR / "telegram_seen_updates.json"))).resolve()
+
+
+def _read_seen_updates() -> dict:
+    """
+    Small persisted dedup store in case Telegram updates are re-processed after restarts.
+    Shape: {"seen_update_ids":[...], "seen_message_ids":[...], "updated_ts": epoch}
+    """
+
+    p = _seen_updates_path()
+    if not p.is_file():
+        return {"seen_update_ids": [], "seen_message_ids": [], "updated_ts": 0}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            raise ValueError("bad json")
+        d.setdefault("seen_update_ids", [])
+        d.setdefault("seen_message_ids", [])
+        d.setdefault("updated_ts", 0)
+        return d
+    except Exception:
+        return {"seen_update_ids": [], "seen_message_ids": [], "updated_ts": 0}
+
+
+def _write_seen_updates(d: dict) -> None:
+    p = _seen_updates_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
+        tmp.replace(p)
+    except OSError as e:
+        print(f"[telegram] seen-updates write failed: {e}", flush=True)
+
+
+def _dedup_should_process(update_id: Optional[int], message_id: Optional[int]) -> bool:
+    """
+    Return True if we should process this update, False if it's a duplicate we've already handled.
+    Offset *should* prevent duplicates, but this protects against restarts / offset resets.
+    """
+
+    MAX_IDS = 250
+    now = time.time()
+    with _seen_updates_file_lock:
+        d = _read_seen_updates()
+        seen_u = []
+        for x in (d.get("seen_update_ids") or []):
+            try:
+                seen_u.append(int(x))
+            except Exception:
+                pass
+        seen_m = []
+        for x in (d.get("seen_message_ids") or []):
+            try:
+                seen_m.append(int(x))
+            except Exception:
+                pass
+
+        if update_id is not None:
+            try:
+                uid = int(update_id)
+            except Exception:
+                uid = None
+            if uid is not None:
+                if uid in seen_u:
+                    return False
+                seen_u.append(uid)
+
+        if message_id is not None:
+            try:
+                mid = int(message_id)
+            except Exception:
+                mid = None
+            if mid is not None:
+                if mid in seen_m:
+                    return False
+                seen_m.append(mid)
+
+        d["seen_update_ids"] = seen_u[-MAX_IDS:]
+        d["seen_message_ids"] = seen_m[-MAX_IDS:]
+        d["updated_ts"] = now
+        _write_seen_updates(d)
+        return True
+
+
+def _telegram_lock_path() -> Path:
+    return Path(os.getenv("LOKI_TELEGRAM_LOCK_PATH", str(ld.MEMORY_DIR / "telegram_bot_lock.json"))).resolve()
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 1:
+        return False
+    try:
+        # Works on Unix/macOS: signal 0 performs error checking only.
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _acquire_telegram_singleton_lock() -> bool:
+    """
+    Ensure only one Loki process runs the Telegram poller.
+    Prevents duplicated / glitchy replies if multiple Web UI instances are running.
+    """
+
+    p = _telegram_lock_path()
+    with _telegram_lock_file_lock:
+        if p.is_file():
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                d = {}
+            try:
+                pid = int(d.get("pid") or 0)
+            except Exception:
+                pid = 0
+            if pid and _pid_is_alive(pid):
+                started = d.get("started_ts") or "?"
+                print(
+                    f"[telegram] not starting: lock held by pid={pid} started_ts={started} (lock file: {p})",
+                    flush=True,
+                )
+                return False
+
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({"pid": os.getpid(), "started_ts": time.time()}, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(p)
+        except OSError as e:
+            print(f"[telegram] lock write failed: {e} (continuing anyway)", flush=True)
+            return True
+        return True
 
 
 def _reload_repo_dotenv() -> None:
@@ -395,6 +539,53 @@ def _strip_model_fences(s: str) -> str:
     s = re.sub(r'[`"\']+$', "", s)
     return s.strip()
 
+def _skip_backlog_on_start_enabled() -> bool:
+    return os.getenv("LOKI_TELEGRAM_SKIP_BACKLOG_ON_START", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _stale_seconds_threshold() -> int:
+    """
+    Drop messages older than this many seconds to avoid "barf" after restarts.
+    Set 0 to disable.
+    """
+
+    raw = (os.getenv("LOKI_TELEGRAM_DROP_STALE_SECONDS", "180") or "").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 180
+    return max(0, min(n, 24 * 3600))
+
+
+def _maybe_advance_offset_past_backlog(token: str) -> None:
+    """
+    If no offset file exists (first run or file deleted), Telegram will deliver the whole pending queue.
+    That can produce a burst of replies that looks like the model "barfed up a million messages".
+
+    This drains the queue *without replying* by advancing the persisted offset to the latest update_id.
+    """
+
+    if not _skip_backlog_on_start_enabled():
+        return
+    # If we already have an offset file, we assume the user wants continuity.
+    if _poll_offset_path().is_file():
+        return
+    try:
+        params: dict = {"timeout": 0, "allowed_updates": json.dumps(["message"])}
+        r = requests.get(f"{TELEGRAM_API}/bot{token}/getUpdates", params=params, timeout=20)
+        data = r.json()
+        results = data.get("result") or []
+        if not results:
+            return
+        last = results[-1]
+        uid = last.get("update_id")
+        if uid is None:
+            return
+        _write_poll_offset(int(uid))
+        print(f"[telegram] advanced offset past backlog: last_update_id={int(uid)}", flush=True)
+    except Exception as e:
+        print(f"[telegram] backlog-skip failed (continuing): {e}", flush=True)
+
 
 def _load_optional_instructions_file() -> str:
     path = (os.getenv("LOKI_TELEGRAM_PROACTIVE_INSTRUCTIONS_PATH") or "").strip()
@@ -507,12 +698,64 @@ def _admin_help_text() -> str:
         "/loki_help\n"
         "/loki_status\n"
         "/loki_mem_refresh\n"
+        "/loki_tg_reset  (reset Telegram offset/dedup + optionally wipe Telegram thread)\n"
         "/loki_restart\n"
         "/loki_stop\n"
         "/loki_pause <duration>  (examples: 30m, 2h, 45s)\n"
         "/loki_resume\n"
         "\n"
         "Remote control requires: LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL=1"
+    )
+
+
+def _telegram_thread_id() -> str:
+    tid = (os.getenv("LOKI_TELEGRAM_THREAD_ID") or "telegram").strip().lower()
+    return tid or "telegram"
+
+
+def _telegram_thread_path() -> Path:
+    # Matches loki_direct_webui.py: memories/chat_threads/<tid>.json
+    return (ld.MEMORY_DIR / "chat_threads" / f"{_telegram_thread_id()}.json").resolve()
+
+
+def _tg_reset(wipe_thread: bool) -> str:
+    """
+    Reset Telegram processing state so touching Telegram doesn't drain backlog or replay old messages.
+    """
+
+    removed: List[str] = []
+    kept: List[str] = []
+    for p in (_poll_offset_path(), _seen_updates_path(), _telegram_lock_path()):
+        try:
+            if p.is_file():
+                p.unlink()
+                removed.append(p.name)
+            else:
+                kept.append(p.name)
+        except OSError as e:
+            kept.append(f"{p.name} (unlink failed: {e})")
+
+    tp = _telegram_thread_path()
+    if wipe_thread:
+        try:
+            if tp.is_file():
+                tp.unlink()
+                removed.append(str(tp.relative_to(ld.MEMORY_DIR)))
+            else:
+                kept.append(str(tp.relative_to(ld.MEMORY_DIR)) + " (missing)")
+        except Exception as e:
+            kept.append(f"{tp} (unlink failed: {e})")
+
+    note = (
+        "Done. Restart the Loki GUI/Web UI now. First run will skip backlog and resume cleanly."
+        if removed
+        else "No files removed; restart Loki anyway."
+    )
+    return (
+        "[telegram reset]\n"
+        + (f"- removed: {', '.join(removed)}\n" if removed else "")
+        + (f"- kept: {', '.join(kept)}\n" if kept else "")
+        + note
     )
 
 
@@ -544,9 +787,34 @@ def _poll_loop(ui: Any, token: str, allowed: List[int]) -> None:
                     offset = int(uid) + 1
                     _write_poll_offset(int(uid))
                 msg = u.get("message") or {}
+                mid = msg.get("message_id")
+                try:
+                    uid_i = int(uid) if uid is not None else None
+                except Exception:
+                    uid_i = None
+                try:
+                    mid_i = int(mid) if mid is not None else None
+                except Exception:
+                    mid_i = None
+                if not _dedup_should_process(uid_i, mid_i):
+                    print(f"[telegram] duplicate ignored update_id={uid_i} message_id={mid_i}", flush=True)
+                    continue
                 chat = msg.get("chat") or {}
                 cid = chat.get("id")
                 text = (msg.get("text") or "").strip()
+                try:
+                    msg_date = int(msg.get("date") or 0)
+                except Exception:
+                    msg_date = 0
+                stale_s = _stale_seconds_threshold()
+                if stale_s > 0 and msg_date > 0:
+                    age = int(time.time() - msg_date)
+                    if age > stale_s:
+                        print(
+                            f"[telegram] stale ignored update_id={uid_i} message_id={mid_i} age_s={age} threshold_s={stale_s}",
+                            flush=True,
+                        )
+                        continue
                 if cid is None:
                     continue
                 try:
@@ -624,10 +892,30 @@ def _poll_loop(ui: Any, token: str, allowed: List[int]) -> None:
                     folder = (os.getenv("LOKI_TELEGRAM_MEM_REFRESH_PATH") or "memories/Chats/Chat Screenshots").strip()
                     send_telegram_message(token, cid_i, f"Refreshing memory from: {folder}")
                     try:
-                        reply = ui.handle_text(f"/ingest {folder}", from_voice=False, blocking=True, skip_tts=True)
+                        reply = ui.handle_text(
+                            f"/ingest {folder}",
+                            from_voice=False,
+                            blocking=True,
+                            skip_tts=True,
+                            channel="telegram",
+                        )
                     except Exception as e:
                         reply = f"[error] {e}"
                     send_telegram_message(token, cid_i, str(reply))
+                    continue
+
+                if text.startswith("/loki_tg_reset"):
+                    if not _remote_admin_enabled():
+                        send_telegram_message(
+                            token,
+                            cid_i,
+                            "Remote control is disabled. Set LOKI_TELEGRAM_ALLOW_REMOTE_CONTROL=1 in .env and restart Web UI.",
+                        )
+                        continue
+                    # Optional: /loki_tg_reset wipe
+                    wipe = bool(re.search(r"\bwipe\b", text, flags=re.IGNORECASE))
+                    msg_reset = _tg_reset(wipe_thread=wipe)
+                    send_telegram_message(token, cid_i, msg_reset)
                     continue
 
                 if text.startswith("/loki_restart"):
@@ -714,7 +1002,13 @@ def _poll_loop(ui: Any, token: str, allowed: List[int]) -> None:
                 print(f"[telegram] inbound chat_id={cid_i} text_len={len(text)}", flush=True)
                 ui._enqueue_event("user", f"[Telegram] {text}")
                 try:
-                    reply = ui.handle_text(text, from_voice=False, blocking=True, skip_tts=True)
+                    reply = ui.handle_text(
+                        text,
+                        from_voice=False,
+                        blocking=True,
+                        skip_tts=True,
+                        channel="telegram",
+                    )
                 except Exception as e:
                     reply = f"[error] {e}"
                     print(f"[telegram] handle_text error: {e}", flush=True)
@@ -808,8 +1102,18 @@ def telegram_status_dict() -> dict:
     _reload_repo_dotenv()
     repo = Path(__file__).resolve().parent
     env_file = repo / ".env"
+    lock_path = _telegram_lock_path()
+    lock_info: dict = {"path": str(lock_path), "exists": lock_path.is_file()}
+    if lock_path.is_file():
+        try:
+            d = json.loads(lock_path.read_text(encoding="utf-8"))
+        except Exception:
+            d = {}
+        lock_info["pid"] = d.get("pid")
+        lock_info["started_ts"] = d.get("started_ts")
     raw = os.getenv("LOKI_TELEGRAM", "")
     tok = _bot_token()
+    seen_path = _seen_updates_path()
     masked = ""
     if tok and ":" in tok:
         masked = "…" + tok[-6:]
@@ -824,6 +1128,8 @@ def telegram_status_dict() -> dict:
         "has_bot_token": bool(tok),
         "token_suffix_masked": masked,
         "allowed_chat_ids_count": len(_allowed_chat_ids()),
+        "telegram_singleton_lock": lock_info,
+        "telegram_seen_updates_path": str(seen_path),
         "hint": "If has_bot_token is false, check TELEGRAM_BOT_TOKEN in repo .env. Restart Web UI after edits.",
     }
 
@@ -832,11 +1138,14 @@ def maybe_start_telegram(ui: Any) -> None:
     _reload_repo_dotenv()
     if not _enabled():
         return
+    if not _acquire_telegram_singleton_lock():
+        return
     token = _bot_token()
     allowed = _allowed_chat_ids()
     if not token or not allowed:
         print("[telegram] LOKI_TELEGRAM=1 but TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_CHAT_IDS is missing", flush=True)
         return
+    _maybe_advance_offset_past_backlog(token)
     me = _telegram_get(token, "getMe")
     if me.get("ok"):
         un = (me.get("result") or {}).get("username") or "?"

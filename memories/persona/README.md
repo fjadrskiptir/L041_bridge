@@ -1,14 +1,40 @@
-# Persona (`memories/persona/`)
+# Persona bundle (`memories/persona/`)
 
-## `instructions.md` (canonical)
+Everything here is **injected into the system prompt** (not the vector memory snapshot), so it is not duplicated by `load_memories()`.
 
-This file is loaded into the **system prompt** on every model call. Use it for personality, writing style, cadence, boundaries, and how Loki should address the user.
+## Files (same folder — this is the single “core” location)
 
-- **Web UI:** expand **Personality & instructions**, edit, then **Save & apply to chat**.
-- **Chat:** `/persona` shows the path; `/mem` reloads memories **and** this file into the running session.
-- **Env overrides:** `LOKI_PERSONA_DIR`, `LOKI_PERSONA_INSTRUCTIONS_PATH`, `LOKI_PERSONA_INSTRUCTIONS_MAX_CHARS`.
-- **Tools (chat):** `read_persona_instructions`, `update_persona_instructions` — Loki can load or change this file when you ask; `append` vs `replace` modes are supported.
+| File | Purpose |
+|------|--------|
+| **`instructions.md`** | Character, relationship, lore rules, silence/return behavior, Grok-parity notes. **Gitignored** — your private live file. |
+| **`spoken_voice.md`** | How replies should **read** and **sound** for TTS (cadence, anti-bot, British/deep register cues). Tracked or private—your choice. |
+| **`user_facts.md`** | Curated **facts about Ness** (preferences, routines, biography, coping patterns she names, etc.). Loki appends via **`record_user_fact`**; auto-loaded into the system prompt. **Gitignored.** |
+| **`instructions.example.md`** | Repo-maintained, **AI-oriented** template (migration timeline ChatGPT → Grok → local, screenshot/journal style ground truth, voice fingerprint). Copy → `instructions.md` to adopt or merge. |
 
-## Other files here
+## First-time setup
 
-Everything under `memories/persona/` is **excluded** from the automatic memory-folder text snapshot (so `instructions.md` is not duplicated). You can still add notes for yourself or use `/ingest` on a file if you want it in vector search.
+```bash
+cd /path/to/l041_bridge
+cp memories/persona/instructions.example.md memories/persona/instructions.md
+# Edit instructions.md + spoken_voice.md, then in chat:
+#   /mem
+# or Web UI: Reload memories / Save persona panel as needed.
+```
+
+## Commands & tools
+
+- **`/persona`** — path + size of `instructions.md`
+- **`/voice_style`** — path + size of `spoken_voice.md`
+- **`/mem`** — reload memories **and** both persona files into the running session
+- Tools: `read_persona_instructions`, `update_persona_instructions`, `read_spoken_style_instructions`, `update_spoken_style_instructions`, `record_user_fact`
+
+## Env overrides
+
+- `LOKI_PERSONA_DIR`, `LOKI_PERSONA_INSTRUCTIONS_PATH`, `LOKI_PERSONA_INSTRUCTIONS_MAX_CHARS`
+- `LOKI_SPOKEN_STYLE_PATH`, `LOKI_SPOKEN_STYLE_MAX_CHARS`
+- `LOKI_USER_FACTS_PATH`, `LOKI_USER_FACTS_MAX_CHARS`, `LOKI_USER_FACTS` (`0` disables the tool and prompt block)
+- Chat sampling (less “clinical” defaults): `LOKI_CHAT_TEMPERATURE_WITH_TOOLS`, `LOKI_CHAT_TEMPERATURE_NO_TOOLS`, optional `LOKI_CHAT_TEMPERATURE` (single override), `LOKI_CHAT_TOP_P` — see root **README** Environment toggles → xAI.
+
+## Optional notes
+
+You may add other markdown files here for **your** reference; **`instructions.md`**, **`spoken_voice.md`**, and **`user_facts.md`** (when present) are auto-loaded into the system prompt unless you change paths via env.

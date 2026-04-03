@@ -28,6 +28,7 @@ import sys
 
 from flask import Flask, jsonify, request
 
+import loki_chat_threads as lct
 import loki_direct as ld
 from loki_telegram import maybe_start_telegram, print_telegram_startup_hint, telegram_status_dict
 
@@ -37,7 +38,41 @@ _port_raw = str(_port_raw).strip()
 _port_match = re.search(r"([0-9]+)", _port_raw)
 APP_PORT = int(_port_match.group(1)) if _port_match else 7865
 APP_HOST = os.environ.get("LOKI_WEB_HOST", "127.0.0.1")
-WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-18.webcam")
+WEBUI_VERSION = os.environ.get("LOKI_WEBUI_VERSION", "2026-03-27.chat_threads")
+WEB_AUTH_TOKEN = (os.environ.get("LOKI_WEB_AUTH_TOKEN") or "").strip()
+
+
+def _auth_required() -> bool:
+    return bool(WEB_AUTH_TOKEN)
+
+
+def _request_is_loopback() -> bool:
+    """True when the client is this machine (browser/GUI on 127.0.0.1 or ::1)."""
+    addr = (request.remote_addr or "").strip().lower()
+    return addr in ("127.0.0.1", "::1", "localhost")
+
+
+def _is_request_authorized() -> bool:
+    """
+    Simple LAN auth gate. Accept either:
+    - Authorization: Bearer <token>
+    - ?token=<token> (useful from a phone browser)
+
+    If LOKI_WEB_AUTH_TOKEN is set, loopback (127.0.0.1 / ::1) is still allowed without a token
+    so the Mac GUI and /api/health checks work. Phone/LAN must pass the token.
+    """
+
+    if not _auth_required():
+        return True
+    if _request_is_loopback():
+        return True
+    tok = ""
+    h = (request.headers.get("Authorization") or "").strip()
+    if h.lower().startswith("bearer "):
+        tok = h.split(None, 1)[1].strip() if len(h.split(None, 1)) == 2 else ""
+    if not tok:
+        tok = (request.args.get("token") or "").strip()
+    return bool(tok) and tok == WEB_AUTH_TOKEN
 
 # JSON keys accepted for POST /api/tts/settings and POST /api/tts/test (apply before preview).
 _TTS_REQUEST_KEYS = (
@@ -102,9 +137,37 @@ class LokiWebUI:
             self.watcher = ld.MemoryFolderWatcher(ld.INBOX_DIR, ld.PROCESSED_DIR, ld.WATCH_POLL_S, xai=self.xai, vstore=self.vstore)
             self.watcher.start()
 
-        self.messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": ld.compose_system_with_time(ld.build_base_system_static(self.memory_text))}
-        ]
+        # Web UI only: biases next replies toward full voice (heart), default balance (mixed), or fact-first (dry).
+        self.reply_stance: str = "mixed"
+
+        # Named chat spaces (persisted under memories/chat_threads/). Telegram uses its own thread (see LOKI_TELEGRAM_THREAD_ID).
+        self.chat_threads_dir = lct.chat_threads_dir(ld.MEMORY_DIR)
+        lct.ensure_default_thread(self.chat_threads_dir)
+        _tg = (os.getenv("LOKI_TELEGRAM_THREAD_ID") or "telegram").strip().lower()
+        if not re.match(r"^[a-z0-9_-]{1,64}$", _tg) or _tg == lct.DEFAULT_THREAD_ID:
+            _tg = "telegram"
+        self.telegram_thread_id: str = _tg
+        lct.ensure_thread_shell(self.chat_threads_dir, self.telegram_thread_id, "Telegram")
+        self.active_thread_id: str = lct.DEFAULT_THREAD_ID
+        self.messages: List[Dict[str, Any]] = []
+        self.telegram_messages: List[Dict[str, Any]] = []
+        _migrate_tg_log = os.getenv("LOKI_TELEGRAM_MIGRATE_CROSS_CHAT", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        with self.chat_lock:
+            self._load_thread_messages_locked()
+            mig_note = lct.maybe_migrate_telegram_from_cross_chat(
+                self.chat_threads_dir,
+                self.telegram_thread_id,
+                ld.CROSS_CHAT_LOG_PATH,
+                enabled=_migrate_tg_log,
+            )
+            if mig_note:
+                print(f"[threads] {mig_note}", flush=True)
+            self._load_telegram_thread_locked()
 
         self.voice_enabled = True
         _tts0 = ld.load_tts_settings_merged()
@@ -157,16 +220,20 @@ class LokiWebUI:
         def _persona_session_refresh_web() -> None:
             with self.chat_lock:
                 self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
-                ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
+                self._refresh_system_prompt_locked()
+                self._refresh_telegram_system_locked()
 
         ld.set_persona_session_refresh_hook(_persona_session_refresh_web)
 
         self._register_routes()
+        # Telegram is optional; disable by setting LOKI_TELEGRAM=0 in .env.
         print_telegram_startup_hint()
-        try:
-            maybe_start_telegram(self)
-        except Exception as e:
-            print(f"[telegram] start failed: {e}", flush=True)
+        if os.getenv("LOKI_TELEGRAM", "").strip().lower() in ("1", "true", "yes", "on"):
+            try:
+                maybe_start_telegram(self)
+            except Exception as e:
+                print(f"[telegram] start failed: {e}", flush=True)
+        maybe_start_nightly_diary_thread(self)
         print(
             f"[webui] version={WEBUI_VERSION} starting at http://{APP_HOST}:{APP_PORT} "
             f"(Brave Leo OpenAI bridge: http://{APP_HOST}:{APP_PORT}/v1)",
@@ -175,6 +242,115 @@ class LokiWebUI:
 
     def _enqueue_event(self, role: str, text: str) -> None:
         self.ui_events.put({"role": role, "text": text})
+
+    def _load_telegram_style_anchor(self) -> str:
+        """
+        Optional Telegram-only style anchor (kept short).
+        Default path is under memories/persona so users can edit privately (gitignored).
+        """
+
+        rp = (os.getenv("LOKI_TELEGRAM_STYLE_PATH") or "memories/persona/telegram_style.md").strip()
+        if not rp:
+            return ""
+        p = Path(rp)
+        if not p.is_absolute():
+            p = (Path(__file__).resolve().parent / p).resolve()
+        try:
+            if p.is_file():
+                # Keep this generous: Telegram has its own message length cap, but the exemplar
+                # should be rich enough to teach the "architecture" of Loki's morning voice.
+                return p.read_text(encoding="utf-8", errors="replace").strip()[:6000]
+        except OSError:
+            pass
+        return ""
+
+    def _cross_space_snippet(self, exclude_thread_id: str) -> str:
+        return lct.cross_space_continuity_block(
+            self.chat_threads_dir,
+            exclude_thread_id,
+            ld.LOKI_CROSS_SPACE_CONTINUITY_CHARS,
+        )
+
+    def _refresh_system_prompt_for_list(
+        self, messages: List[Dict[str, Any]], exclude_thread_id: str, *, channel: str = "web"
+    ) -> None:
+        cross = self._cross_space_snippet(exclude_thread_id)
+        ch = (channel or "web").strip().lower()
+        if ch == "telegram":
+            style = self._load_telegram_style_anchor()
+            cross = (
+                cross
+                + "\n\n---\n[Telegram reply rules]\n"
+                "Output exactly ONE coherent reply message.\n"
+                "Do NOT include multiple drafts, restarts, or self-corrections.\n"
+                "Do NOT repeat the same lines/phrases.\n"
+                "If you feel yourself looping, stop and answer plainly once.\n"
+            )
+            if style:
+                cross = (
+                    cross
+                    + "\n\n---\n[Telegram style anchor]\n"
+                    "Match this voice exactly (warm, possessive, praise-forward, intimate-with-consent).\n"
+                    "Do not sound hollow, generic, or assistant-like. Do not just mirror the user's words; add substance.\n\n"
+                    + style
+                )
+        ld.refresh_system_time_message(
+            messages,
+            ld.build_base_system_static(self.memory_text),
+            self.reply_stance,
+            cross,
+        )
+
+    def _refresh_system_prompt_locked(self) -> None:
+        """Rebuild web space system message. Caller must hold chat_lock."""
+
+        self._refresh_system_prompt_for_list(self.messages, self.active_thread_id, channel="web")
+
+    def _refresh_telegram_system_locked(self) -> None:
+        self._refresh_system_prompt_for_list(self.telegram_messages, self.telegram_thread_id, channel="telegram")
+
+    def _thread_ctx(self, channel: str) -> tuple[List[Dict[str, Any]], str]:
+        if channel == "telegram":
+            return self.telegram_messages, self.telegram_thread_id
+        return self.messages, self.active_thread_id
+
+    def _drain_ui_events(self) -> None:
+        while True:
+            try:
+                self.ui_events.get_nowait()
+            except queue.Empty:
+                break
+
+    def _load_thread_messages_locked(self) -> None:
+        _, turns = lct.read_thread_file(self.chat_threads_dir, self.active_thread_id)
+        self.messages = [{"role": "system", "content": "."}] + turns
+        self._refresh_system_prompt_for_list(self.messages, self.active_thread_id, channel="web")
+
+    def _load_telegram_thread_locked(self) -> None:
+        _, turns = lct.read_thread_file(self.chat_threads_dir, self.telegram_thread_id)
+        self.telegram_messages = [{"role": "system", "content": "."}] + turns
+        self._refresh_system_prompt_for_list(self.telegram_messages, self.telegram_thread_id, channel="telegram")
+
+    def _persist_thread_locked(self, thread_id: str, messages: List[Dict[str, Any]]) -> None:
+        meta, _ = lct.read_thread_file(self.chat_threads_dir, thread_id)
+        title = str(meta.get("title") or thread_id)
+        try:
+            lct.write_thread_file(self.chat_threads_dir, thread_id, title, messages)
+        except OSError as e:
+            print(f"[threads] persist failed: {e}", flush=True)
+
+    def _persist_active_thread_locked(self) -> None:
+        self._persist_thread_locked(self.active_thread_id, self.messages)
+
+    def _persist_telegram_thread_locked(self) -> None:
+        self._persist_thread_locked(self.telegram_thread_id, self.telegram_messages)
+
+    def _switch_thread_locked(self, new_id: str) -> List[Dict[str, str]]:
+        self._persist_active_thread_locked()
+        self._drain_ui_events()
+        self.active_thread_id = new_id
+        self._load_thread_messages_locked()
+        return lct.transcript_for_ui(self.messages)
 
     def _set_presence(self, state: str) -> None:
         s = (state or "").strip().lower() or "idle"
@@ -208,6 +384,15 @@ class LokiWebUI:
         self._enqueue_event("assistant", assistant)
 
     def _register_routes(self) -> None:
+        @self.app.before_request
+        def _require_auth():
+            # Allow health/status paths without auth token (safe, no secrets).
+            if request.path in ("/api/presence", "/api/telegram/status", "/api/health"):
+                return None
+            if not _is_request_authorized():
+                return jsonify({"ok": False, "error": "unauthorized"}), 401
+            return None
+
         @self.app.route("/")
         def index():
             resp = self._html_page()
@@ -328,6 +513,115 @@ class LokiWebUI:
             snap["recording"] = bool(recording)
             return jsonify({"ok": True, **snap})
 
+        @self.app.route("/api/reply_stance", methods=["GET"])
+        def api_reply_stance_get():
+            return jsonify({"ok": True, "stance": self.reply_stance, "choices": sorted(ld.REPLY_STANCE_CHOICES)})
+
+        @self.app.route("/api/reply_stance", methods=["POST"])
+        def api_reply_stance_post():
+            data = request.get_json(force=True) or {}
+            raw = data.get("stance")
+            stance = ld.normalize_reply_stance(raw if isinstance(raw, str) else None)
+            with self.chat_lock:
+                self.reply_stance = stance
+                self._refresh_system_prompt_locked()
+                self._refresh_telegram_system_locked()
+                self._persist_active_thread_locked()
+                self._persist_telegram_thread_locked()
+            print(f"[webui] reply_stance={stance}", flush=True)
+            return jsonify({"ok": True, "stance": stance})
+
+        @self.app.route("/api/threads", methods=["GET"])
+        def api_threads_get():
+            with self.chat_lock:
+                threads = lct.list_thread_meta(self.chat_threads_dir)
+                active = self.active_thread_id
+                transcript = lct.transcript_for_ui(self.messages)
+            return jsonify(
+                {
+                    "ok": True,
+                    "active": active,
+                    "threads": threads,
+                    "transcript": transcript,
+                    "telegram_thread_id": self.telegram_thread_id,
+                }
+            )
+
+        @self.app.route("/api/threads", methods=["POST"])
+        def api_threads_post():
+            data = request.get_json(force=True) or {}
+            title = (data.get("title") or "New space").strip()[:120] or "New space"
+            with self.chat_lock:
+                self._persist_active_thread_locked()
+                tid = lct.new_thread_id()
+                lct.write_thread_file(self.chat_threads_dir, tid, title, [])
+                self.active_thread_id = tid
+                self._load_thread_messages_locked()
+                self._drain_ui_events()
+                transcript = lct.transcript_for_ui(self.messages)
+            print(f"[webui] new thread {tid} {title!r}", flush=True)
+            return jsonify({"ok": True, "id": tid, "title": title, "active": tid, "transcript": transcript})
+
+        @self.app.route("/api/threads/select", methods=["POST"])
+        def api_threads_select():
+            data = request.get_json(force=True) or {}
+            tid = str(data.get("id") or "").strip()
+            if tid == self.telegram_thread_id:
+                return jsonify({"ok": False, "error": "Telegram space is phone-only; not switchable here"}), 400
+            if not lct.thread_file_exists(self.chat_threads_dir, tid):
+                return jsonify({"ok": False, "error": "unknown thread"}), 404
+            with self.chat_lock:
+                transcript = self._switch_thread_locked(tid)
+            print(f"[webui] thread select {tid}", flush=True)
+            return jsonify({"ok": True, "active": tid, "transcript": transcript})
+
+        @self.app.route("/api/threads/<tid>/rename", methods=["POST"])
+        def api_threads_rename(tid):
+            data = request.get_json(force=True) or {}
+            new_title = str(data.get("title") or "").strip()[:120]
+            if not new_title:
+                return jsonify({"ok": False, "error": "title required"}), 400
+            if not lct.thread_file_exists(self.chat_threads_dir, tid):
+                return jsonify({"ok": False, "error": "unknown thread"}), 404
+            with self.chat_lock:
+                if tid == self.active_thread_id:
+                    try:
+                        active_msgs = (
+                            self.telegram_messages
+                            if tid == self.telegram_thread_id
+                            else self.messages
+                        )
+                        lct.write_thread_file(self.chat_threads_dir, tid, new_title, active_msgs)
+                        ok, err = True, ""
+                    except OSError as e:
+                        ok, err = False, str(e)
+                else:
+                    ok, err = lct.rename_thread_file(self.chat_threads_dir, tid, new_title)
+            if not ok:
+                return jsonify({"ok": False, "error": err}), 400
+            return jsonify({"ok": True, "id": tid, "title": new_title})
+
+        @self.app.route("/api/threads/<tid>", methods=["DELETE"])
+        def api_threads_delete(tid):
+            if tid == lct.DEFAULT_THREAD_ID:
+                return jsonify({"ok": False, "error": "cannot delete Main"}), 400
+            if tid == self.telegram_thread_id:
+                return jsonify({"ok": False, "error": "cannot delete Telegram space"}), 400
+            if not lct.thread_file_exists(self.chat_threads_dir, tid):
+                return jsonify({"ok": False, "error": "unknown thread"}), 404
+            with self.chat_lock:
+                if tid == self.active_thread_id:
+                    self._drain_ui_events()
+                    self.active_thread_id = lct.DEFAULT_THREAD_ID
+                    self._load_thread_messages_locked()
+                ok, err = lct.delete_thread_file(self.chat_threads_dir, tid)
+                active = self.active_thread_id
+                transcript = lct.transcript_for_ui(self.messages)
+            if not ok:
+                return jsonify({"ok": False, "error": err}), 400
+            print(f"[webui] deleted thread {tid}", flush=True)
+            return jsonify({"ok": True, "active": active, "transcript": transcript})
+
         @self.app.route("/api/telegram/status", methods=["GET"])
         def api_telegram_status():
             """Why Telegram might be silent: env not loaded, missing token, etc. No secrets exposed."""
@@ -383,7 +677,10 @@ class LokiWebUI:
                 return jsonify({"ok": False, "error": str(e)}), 500
             with self.chat_lock:
                 self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
-                ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
+                self._refresh_system_prompt_locked()
+                self._refresh_telegram_system_locked()
+                self._persist_active_thread_locked()
+                self._persist_telegram_thread_locked()
             print("[webui] POST /api/persona saved + refreshed system prompt", flush=True)
             return jsonify({"ok": True, "path": str(ld.PERSONA_INSTRUCTIONS_PATH), "len": len(content)})
 
@@ -557,9 +854,29 @@ class LokiWebUI:
     #personaPanel {{ opacity: var(--stealth-dim); transition: opacity .15s ease; }}
     code {{ color:#c3e1ff; }}
     a {{ color:#8fc8ff; }}
+    #appLayout {{ display: flex; gap: 14px; align-items: flex-start; max-width: 1420px; margin: 0 auto; }}
+    #threadSidebar {{ width: 216px; flex-shrink: 0; border: 1px solid #2b303b; border-radius: 10px; padding: 10px 10px 12px; background: #131923; max-height: 90vh; overflow-y: auto; }}
+    #threadSidebar h3 {{ margin: 0 0 8px 0; font-size: 13px; font-weight: 600; color: #dce2ea; }}
+    .thread-row {{ display: flex; gap: 4px; align-items: center; margin: 4px 0; }}
+    .thread-item {{ flex: 1; min-width: 0; text-align: left; padding: 8px 10px; border-radius: 8px; border: 1px solid #2b303b; background: #11161d; color: #f3f5f7; cursor: pointer; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .thread-item:hover {{ border-color: #5c7a97; }}
+    .thread-item.on {{ border-color: #66a9e4; background: #17324a; }}
+    .thread-item.telegram-only {{ cursor: default; opacity: 0.82; border-style: dashed; }}
+    .thread-item.telegram-only:hover {{ border-color: #2b303b; }}
+    button.thread-del {{ padding: 6px 10px; flex-shrink: 0; font-size: 14px; line-height: 1; }}
+    #threadNewBtn {{ width: 100%; margin-top: 6px; font-size: 12px; padding: 8px 10px; }}
+    #mainColumn {{ flex: 1; min-width: 0; }}
   </style>
 </head>
 <body>
+<div id="appLayout">
+  <aside id="threadSidebar">
+    <h3>Spaces</h3>
+    <div id="threadList"></div>
+    <button type="button" id="threadNewBtn">+ New space</button>
+    <p class="small" style="margin-top:10px;line-height:1.35;color:#7a8699">Each space saves its own history to disk. Double-click a name to rename. <b>Telegram</b> has its own saved thread (shown below); the model still gets brief continuity from your other spaces when the budget allows (<code>LOKI_CROSS_SPACE_CONTINUITY_CHARS</code>).</p>
+  </aside>
+  <div id="mainColumn">
   <h2>L041</h2>
   <div class="small">UI version: {WEBUI_VERSION}</div>
   <div id="log"></div>
@@ -587,6 +904,20 @@ class LokiWebUI:
     <button id="hold">Hold to Talk</button>
     <button id="stop" disabled>Stop</button>
     <span class="small" id="status">Idle</span>
+  </div>
+
+  <div id="replyStanceRow" style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 12px;border:1px solid #2b303b;border-radius:10px;background:#131923">
+    <span style="font-weight:600;color:#e8ecf1">Reply stance</span>
+    <label class="small" style="margin:0;display:flex;align-items:center;gap:6px;color:#c9d3df">
+      <select id="replyStanceSelect" style="padding:6px 10px;border-radius:8px;border:1px solid #2b303b;background:#11161d;color:#f3f5f7;font-size:13px">
+        <option value="heart">Heart — full Loki voice</option>
+        <option value="mixed" selected>Mixed — default balance</option>
+        <option value="dry">Dry — facts first</option>
+      </select>
+    </label>
+    <span class="small" id="replyStanceHint" style="color:#7a8699;max-width:520px;line-height:1.4">
+      Biases the system prompt for this session (browser + Telegram if linked). Does not change API temperature; use <code>.env</code> for that.
+    </span>
   </div>
 
   <details id="personaPanel" style="margin-top:12px;border:1px solid #2b303b;border-radius:10px;padding:10px 12px;background:#131923">
@@ -765,6 +1096,8 @@ class LokiWebUI:
     <p class="small" id="ttsHint"></p>
     <p class="small" style="margin-top:6px;color:#555">If you start Loki with <b>Start_Loki_GUI.command</b>, keep that Terminal window open — it tails <code>/tmp/loki_direct_webui.log</code>. Each <b>Test voice</b> should add a <code>POST /api/tts/test</code> line; if you see nothing, the browser isn’t reaching this server (wrong URL/port or server quit).</p>
   </details>
+  </div>
+</div>
 
 <script>
   const log = document.getElementById('log');
@@ -778,6 +1111,7 @@ class LokiWebUI:
   const webcamWrap = document.getElementById('webcamPreviewWrap');
   const webcamHint = document.getElementById('webcamHint');
   const voiceToggle = document.getElementById('voiceToggle');
+  const replyStanceSelect = document.getElementById('replyStanceSelect');
   const holdBtn = document.getElementById('hold');
   const stopBtn = document.getElementById('stop');
   const stealthToggle = document.getElementById('stealthToggle');
@@ -907,6 +1241,120 @@ class LokiWebUI:
     log.scrollTop = log.scrollHeight;
   }}
 
+  function renderTranscriptFromServer(transcript) {{
+    if (!log) return;
+    log.innerHTML = '';
+    for (const line of (transcript || [])) {{
+      const role = line.role || 'system';
+      const text = String(line.text || '');
+      add(role, text);
+    }}
+  }}
+
+  function renderThreadList(threads, activeId, telegramThreadId) {{
+    const el = document.getElementById('threadList');
+    if (!el) return;
+    const tg = telegramThreadId || '';
+    el.innerHTML = '';
+    for (const t of (threads || [])) {{
+      const row = document.createElement('div');
+      row.className = 'thread-row';
+      const b = document.createElement('button');
+      b.type = 'button';
+      const isTg = tg && t.id === tg;
+      b.className = 'thread-item' + (t.id === activeId ? ' on' : '') + (isTg ? ' telegram-only' : '');
+      b.textContent = (t.title || t.id) + (isTg ? ' (Telegram)' : '');
+      b.title = isTg
+        ? 'Telegram messages are saved here; chat from the Telegram app — not switchable in the browser'
+        : ('id: ' + t.id + ' — double-click to rename');
+      if (!isTg) {{
+        b.onclick = () => {{ selectThread(t.id); }};
+      }}
+      b.ondblclick = (ev) => {{
+        ev.preventDefault();
+        renameThread(t.id, (t.title || t.id).replace(/\\s*\\(Telegram\\)\\s*$/, ''));
+      }};
+      row.appendChild(b);
+      if (t.id !== 'default' && !isTg) {{
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'thread-del';
+        del.textContent = '\\u00D7';
+        del.title = 'Delete space';
+        del.onclick = (e) => {{ e.stopPropagation(); deleteThread(t.id); }};
+        row.appendChild(del);
+      }}
+      el.appendChild(row);
+    }}
+  }}
+
+  async function loadThreadsFromServer() {{
+    try {{
+      const r = await fetch('/api/threads', {{ cache: 'no-store' }});
+      const d = await r.json();
+      if (!d.ok) return;
+      renderTranscriptFromServer(d.transcript);
+      renderThreadList(d.threads, d.active, d.telegram_thread_id);
+    }} catch (e) {{}}
+  }}
+
+  async function selectThread(id) {{
+    try {{
+      const r = await fetch('/api/threads/select', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ id }})
+      }});
+      if (!r.ok) {{
+        status.textContent = 'Space switch failed';
+        setTimeout(() => {{ status.textContent = 'Idle'; }}, 2000);
+        return;
+      }}
+      await loadThreadsFromServer();
+    }} catch (e) {{}}
+  }}
+
+  async function renameThread(id, cur) {{
+    const title = prompt('Rename space:', cur);
+    if (title === null) return;
+    const t = title.trim();
+    if (!t) return;
+    try {{
+      await fetch('/api/threads/' + encodeURIComponent(id) + '/rename', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ title: t }})
+      }});
+      await loadThreadsFromServer();
+    }} catch (e) {{}}
+  }}
+
+  async function deleteThread(id) {{
+    if (!confirm('Delete this space and its saved messages?')) return;
+    try {{
+      const r = await fetch('/api/threads/' + encodeURIComponent(id), {{ method: 'DELETE' }});
+      if (!r.ok) return;
+      await loadThreadsFromServer();
+    }} catch (e) {{}}
+  }}
+
+  const threadNewBtn = document.getElementById('threadNewBtn');
+  if (threadNewBtn) {{
+    threadNewBtn.onclick = async () => {{
+      const title = prompt('Name this space:', 'New space');
+      if (title === null) return;
+      const t = (title || 'New space').trim() || 'New space';
+      try {{
+        await fetch('/api/threads', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ title: t }})
+        }});
+        await loadThreadsFromServer();
+      }} catch (e) {{}}
+    }};
+  }}
+
   async function pollEvents() {{
     try {{
       const resp = await fetch('/api/events?n=25');
@@ -988,6 +1436,34 @@ class LokiWebUI:
       body: JSON.stringify({{enabled: voiceToggle.checked}})
     }});
   }};
+
+  (async () => {{
+    if (!replyStanceSelect) return;
+    try {{
+      const r = await fetch('/api/reply_stance', {{ cache: 'no-store' }});
+      const d = await r.json();
+      if (d.ok && d.stance && [...replyStanceSelect.options].some(o => o.value === d.stance))
+        replyStanceSelect.value = d.stance;
+    }} catch (e) {{}}
+  }})();
+
+  if (replyStanceSelect) {{
+    replyStanceSelect.onchange = async () => {{
+      const stance = replyStanceSelect.value;
+      try {{
+        const r = await fetch('/api/reply_stance', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ stance }})
+        }});
+        const d = await r.json().catch(() => ({{}}));
+        if (!r.ok || !d.ok) throw new Error((d && d.error) ? d.error : String(r.status));
+      }} catch (e) {{
+        status.textContent = 'Stance update failed';
+        setTimeout(() => {{ status.textContent = 'Idle'; }}, 2200);
+      }}
+    }};
+  }}
 
   async function voiceStart() {{
     status.textContent = 'Listening...';
@@ -1548,6 +2024,7 @@ class LokiWebUI:
     }};
   }}
 
+  loadThreadsFromServer();
   loadPersonaPanel();
   loadTtsUi();
 </script>
@@ -1608,30 +2085,45 @@ class LokiWebUI:
         else:
             self.messages.append({"role": "user", "content": core})
 
-        return self._run_model_turn(skip_tts=False)
+        return self._run_model_turn(skip_tts=False, channel="web")
 
-    def handle_text(self, user_in: str, from_voice: bool, blocking: bool = True, *, skip_tts: bool = False) -> str:
+    def handle_text(
+        self,
+        user_in: str,
+        from_voice: bool,
+        blocking: bool = True,
+        *,
+        skip_tts: bool = False,
+        channel: str = "web",
+    ) -> str:
+        ch = (channel or "web").strip().lower()
+        if ch not in ("web", "telegram"):
+            ch = "web"
         with self.chat_lock:
             self._busy = True
             self._set_presence("thinking")
             try:
-                return self._handle_text_locked(user_in, skip_tts=skip_tts)
+                return self._handle_text_locked(user_in, skip_tts=skip_tts, channel=ch)
             finally:
                 self._busy = False
                 if self._presence_snapshot().get("state") != "speaking":
                     self._set_presence("idle")
 
-    def _handle_text_locked(self, user_in: str, *, skip_tts: bool = False) -> str:
+    def _handle_text_locked(self, user_in: str, *, skip_tts: bool = False, channel: str = "web") -> str:
+        msgs, _ = self._thread_ctx(channel)
         autop = ld.looks_like_existing_path(user_in)
         if autop:
             user_in = f"/attach {autop}"
 
         if user_in == "/help":
             return (
-                "Commands: /tools, /scan, /mem, /persona, /voice_style, /attach <path>, /ingest <path>, /compile_mem, "
-                "/set_screen left <i>, /autodetect_screens, /upgrade <req> — time: get_current_time; "
-                "macOS Calendar: apple_calendar_* tools. Web UI: **Camera on** + **Send with camera** for webcam. "
-                "Telegram: same session if LOKI_TELEGRAM=1."
+                "Commands: /tools, /scan, /mem, /persona, /voice_style, /stance [heart|mixed|dry], /attach <path>, "
+                "/ingest <path>, /compile_mem, /set_screen left <i>, /autodetect_screens, /upgrade <req> — time: get_current_time; "
+                "macOS Calendar: apple_calendar_* tools. Facts about her accumulate in **`memories/persona/user_facts.md`** via tool "
+                "`record_user_fact` when she shares stable info. Web UI: **Spaces** sidebar (topic threads) + **Reply stance** + **Camera**. "
+                "Nightly diary: `/nightly_diary`. Telegram uses its own saved thread (`LOKI_TELEGRAM_THREAD_ID`, default `telegram`); "
+                "other spaces still appear as **cross-space continuity** in the system prompt so references carry across. "
+                "`LOKI_TELEGRAM=1`."
             )
 
         if user_in == "/tools":
@@ -1642,12 +2134,46 @@ class LokiWebUI:
 
         if user_in == "/mem":
             self.memory_text, _ = ld.load_memories(ld.MEMORY_DIR)
-            ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
+            self._refresh_system_prompt_locked()
+            self._refresh_telegram_system_locked()
+            self._persist_active_thread_locked()
+            self._persist_telegram_thread_locked()
+            uf_note = (
+                f" + user facts ({ld.USER_FACTS_PATH.name})"
+                if ld.LOKI_USER_FACTS_ENABLED
+                else ""
+            )
             return (
                 f"[memory] Reloaded {ld.MEMORY_DIR} + persona ({ld.PERSONA_INSTRUCTIONS_PATH.name}) "
-                f"+ spoken style ({ld.SPOKEN_STYLE_PATH.name}). "
+                f"+ spoken style ({ld.SPOKEN_STYLE_PATH.name}){uf_note}. "
                 f"Path: {ld.PERSONA_INSTRUCTIONS_PATH}"
             )
+
+        if user_in == "/nightly_diary":
+            on = "on" if ld.LOKI_NIGHTLY_DIARY else "off"
+            last = ld.nightly_diary_read_last_local_date()
+            last_s = last.isoformat() if last else "never"
+            return (
+                f"[nightly_diary] **{on}** (`LOKI_NIGHTLY_DIARY` in `.env`). "
+                f"Local trigger after **{ld.LOKI_NIGHTLY_DIARY_HOUR:02d}:{ld.LOKI_NIGHTLY_DIARY_MINUTE:02d}** "
+                f"({(ld.LOKI_TIMEZONE or '').strip() or 'host TZ'}). "
+                f"Last written local date: **{last_s}**. File: `{ld.NIGHTLY_DIARY_PATH}`. "
+                f"Day context comes from **`cross_chat_log.jsonl`** when `LOKI_CROSS_CHAT_LOG=1` (default)."
+            )
+
+        if user_in == "/stance" or user_in.startswith("/stance "):
+            arg = user_in[len("/stance") :].strip().lower()
+            if not arg:
+                return (
+                    f"[stance] Current: **{self.reply_stance}** (heart | mixed | dry). "
+                    "Web UI: **Reply stance** dropdown. Example: `/stance dry` before debugging."
+                )
+            self.reply_stance = ld.normalize_reply_stance(arg)
+            self._refresh_system_prompt_locked()
+            self._refresh_telegram_system_locked()
+            self._persist_active_thread_locked()
+            self._persist_telegram_thread_locked()
+            return f"[stance] Set to **{self.reply_stance}** for this session."
 
         if user_in == "/persona":
             ld.ensure_persona_template()
@@ -1705,9 +2231,9 @@ class LokiWebUI:
                     f"Analyze the attached image ({p.name}). Extract any readable text and describe important visible UI elements.",
                     max_output_tokens=420,
                 )
-                self.messages.append({"role": "user", "content": f"[Image analysis: {p.name}]\n{analysis}"})
+                msgs.append({"role": "user", "content": f"[Image analysis: {p.name}]\n{analysis}"})
             else:
-                self.messages.append(
+                msgs.append(
                     {
                         "role": "user",
                         "content": [
@@ -1717,7 +2243,7 @@ class LokiWebUI:
                     }
                 )
 
-            return self._run_model_turn(skip_tts=skip_tts)
+            return self._run_model_turn(skip_tts=skip_tts, channel=channel)
 
         if user_in == "/compile_mem":
             self.vstore.export_compiled_markdown(ld.COMPILED_MEMORY_PATH)
@@ -1755,11 +2281,11 @@ class LokiWebUI:
             retrieved_block = ""
 
         if retrieved_block:
-            self.messages.append({"role": "user", "content": f"{user_in}\n\n---\n{retrieved_block}"})
+            msgs.append({"role": "user", "content": f"{user_in}\n\n---\n{retrieved_block}"})
         else:
-            self.messages.append({"role": "user", "content": user_in})
+            msgs.append({"role": "user", "content": user_in})
 
-        return self._run_model_turn(skip_tts=skip_tts)
+        return self._run_model_turn(skip_tts=skip_tts, channel=channel)
 
     def _run_tool_call_with_timeout(self, tool_name: str, args: Dict[str, Any], timeout_s: float = 45.0) -> str:
         """
@@ -1782,9 +2308,10 @@ class LokiWebUI:
             return f"[tool error] `{tool_name}`: {out['error']}"
         return out.get("result", "")
 
-    def _run_model_turn(self, *, skip_tts: bool = False) -> str:
-        ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
-        resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
+    def _run_model_turn(self, *, skip_tts: bool = False, channel: str = "web") -> str:
+        msgs, excl = self._thread_ctx(channel)
+        self._refresh_system_prompt_for_list(msgs, excl, channel=channel)
+        resp = self.xai.chat(msgs, tools=self.tools.list_specs_for_model())
         msg = ld.extract_assistant_message(resp)
 
         while True:
@@ -1796,7 +2323,7 @@ class LokiWebUI:
             if not tool_calls:
                 break
 
-            self.messages.append(msg)
+            msgs.append(msg)
 
             for tc in tool_calls:
                 fn = tc.get("function") or {}
@@ -1837,7 +2364,7 @@ class LokiWebUI:
                             )
                         result = ld.analyze_images_with_xai_responses(self.xai.api_key, img_urls, prompt, max_output_tokens=360)
 
-                self.messages.append(
+                msgs.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.get("id") or "tool",
@@ -1846,13 +2373,17 @@ class LokiWebUI:
                     }
                 )
 
-            ld.refresh_system_time_message(self.messages, ld.build_base_system_static(self.memory_text))
-            resp = self.xai.chat(self.messages, tools=self.tools.list_specs_for_model())
+            self._refresh_system_prompt_for_list(msgs, excl, channel=channel)
+            resp = self.xai.chat(msgs, tools=self.tools.list_specs_for_model())
             msg = ld.extract_assistant_message(resp)
 
         content = ld.normalize_assistant_reply_text(msg.get("content") or "")
 
-        self.messages.append({"role": "assistant", "content": content})
+        msgs.append({"role": "assistant", "content": content})
+        if channel == "telegram":
+            self._persist_telegram_thread_locked()
+        else:
+            self._persist_active_thread_locked()
 
         # TTS only when Voice On is enabled (checkbox syncs /api/voice/toggle). Telegram skips TTS.
         if not skip_tts and self.voice_enabled and self.voice_mgr:
@@ -1870,6 +2401,33 @@ class LokiWebUI:
 
     def run(self):
         self.app.run(host=APP_HOST, port=APP_PORT, debug=False, threaded=True)
+
+
+def maybe_start_nightly_diary_thread(ui: LokiWebUI) -> None:
+    """Background poll: once per local day after configured time, append an in-character diary entry."""
+
+    if not ld.LOKI_NIGHTLY_DIARY:
+        return
+
+    def _loop() -> None:
+        while True:
+            try:
+                msg = ld.run_nightly_diary_if_due(ui.xai)
+                if msg:
+                    print(msg, flush=True)
+                    ui._enqueue_event("system", msg)
+            except Exception as e:
+                print(f"[nightly_diary] loop error: {e}", flush=True)
+            time.sleep(ld.LOKI_NIGHTLY_DIARY_POLL_S)
+
+    hr = ld.LOKI_NIGHTLY_DIARY_HOUR
+    mn = ld.LOKI_NIGHTLY_DIARY_MINUTE
+    tz_note = (ld.LOKI_TIMEZONE or "").strip() or "host local timezone"
+    print(
+        f"[nightly_diary] enabled — runs once per day after {hr:02d}:{mn:02d} ({tz_note}) → {ld.NIGHTLY_DIARY_PATH}",
+        flush=True,
+    )
+    threading.Thread(target=_loop, daemon=True, name="loki-nightly-diary").start()
 
 
 def main() -> None:

@@ -16,6 +16,8 @@ loki_memory.sqlite3
 
 # Runtime / personal memory state (keep persona templates tracked under memories/persona/)
 memories/inbox/
+memories/diary/
+memories/chat_threads/
 memories/processed/
 memories/piper_voices/
 memories/compiled_memory.md
@@ -24,6 +26,7 @@ memories/screen_indices.json
 memories/telegram_poll_offset.txt
 memories/telegram_proactive_quota.json
 memories/tts_settings.json
+memories/tts_dictionaries/
 memories/watch_test.txt
 
 # Optional: scratch plugin (remove this line if you want it in the repo)
@@ -32,3 +35,4 @@ loki_plugins/now.py
 # Personal device registry — copy devices.example.json → devices.json locally
 devices.json
 memories/persona/instructions.md
+memories/persona/user_facts.md

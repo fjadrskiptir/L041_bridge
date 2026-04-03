@@ -27,7 +27,8 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+import unicodedata
+from datetime import date, datetime, timezone
 
 try:
     from zoneinfo import ZoneInfo
@@ -122,6 +123,10 @@ XAI_VISION_MODEL = os.getenv("XAI_VISION_MODEL", "grok-4.20-beta-latest-non-reas
 XAI_RESPONSES_ENDPOINT = os.getenv("XAI_RESPONSES_ENDPOINT", "https://api.x.ai/v1/responses")
 
 INTIFACE_WS = os.getenv("INTIFACE_WS", "ws://127.0.0.1:12345")
+# Substring matched against Intiface/Buttplug device names (case-insensitive). Used when devices.json has no profiles or as last-resort fallback.
+INTIFACE_DEVICE_MATCH = (os.getenv("INTIFACE_DEVICE_MATCH", "nora") or "nora").strip() or "nora"
+# When devices.json defines profiles, optional default active profile (short_name). If unset, first entry in file wins.
+INTIFACE_ACTIVE_DEVICE = (os.getenv("INTIFACE_ACTIVE_DEVICE") or "").strip().lower()
 
 MEMORY_DIR = Path(os.getenv("LOKI_MEMORY_DIR", "memories")).resolve()
 PLUGINS_DIR = Path(os.getenv("LOKI_PLUGINS_DIR", "loki_plugins")).resolve()
@@ -140,6 +145,35 @@ SPOKEN_STYLE_PATH = Path(
     os.getenv("LOKI_SPOKEN_STYLE_PATH", str(PERSONA_DIR / "spoken_voice.md"))
 ).resolve()
 SPOKEN_STYLE_MAX_CHARS = int(os.getenv("LOKI_SPOKEN_STYLE_MAX_CHARS", "18000"))
+USER_FACTS_PATH = Path(os.getenv("LOKI_USER_FACTS_PATH", str(PERSONA_DIR / "user_facts.md"))).resolve()
+try:
+    LOKI_USER_FACTS_MAX_CHARS = max(2000, int(os.getenv("LOKI_USER_FACTS_MAX_CHARS", "32000")))
+except ValueError:
+    LOKI_USER_FACTS_MAX_CHARS = 32000
+LOKI_USER_FACTS_ENABLED = os.getenv("LOKI_USER_FACTS", "1").strip().lower() not in ("0", "false", "no", "off")
+
+USER_FACT_CATEGORIES = (
+    "preferences",
+    "routines",
+    "health_mental",
+    "relationships",
+    "biography",
+    "goals",
+    "triggers_coping",
+    "other",
+)
+USER_FACT_SENSITIVITY_LEVELS = ("normal", "clinical", "private")
+
+# TTS text shaping (prosody + pronunciation dictionaries)
+TTS_DICT_DIR = Path(os.getenv("LOKI_TTS_DICT_DIR", str(MEMORY_DIR / "tts_dictionaries"))).expanduser().resolve()
+LOKI_TTS_DICTIONARIES = os.getenv("LOKI_TTS_DICTIONARIES", "1").strip().lower() not in ("0", "false", "no", "off")
+try:
+    LOKI_TTS_MAX_SPOKEN_CHARS = max(600, int(os.getenv("LOKI_TTS_MAX_SPOKEN_CHARS", "2600")))
+except ValueError:
+    LOKI_TTS_MAX_SPOKEN_CHARS = 2600
+
+_tts_dict_cache_lock = threading.Lock()
+_tts_dict_cache: Dict[str, Tuple[float, Dict[str, str]]] = {}
 
 # Shared log: Brave Leo (OpenAI-compatible bridge) + optional home UI → inject into system prompt for continuity.
 CROSS_CHAT_LOG_PATH = Path(os.getenv("LOKI_CROSS_CHAT_LOG_PATH", str(MEMORY_DIR / "cross_chat_log.jsonl"))).resolve()
@@ -154,6 +188,10 @@ LOKI_LEO_BRIDGE_API_KEY = os.getenv("LOKI_LEO_BRIDGE_API_KEY", "").strip()
 # Web search (DuckDuckGo via duckduckgo-search package — no API key).
 LOKI_WEB_SEARCH_ENABLED = os.getenv("LOKI_WEB_SEARCH", "1").strip() not in {"0", "false", "False", "no", "NO"}
 LOKI_WEB_SEARCH_MAX_RESULTS = int(os.getenv("LOKI_WEB_SEARCH_MAX_RESULTS", "8"))
+# When on, system prompt nudges web_search for casual chat that clearly depends on *right now* (weather, local news, etc.).
+LOKI_WEB_SEARCH_BOND_CONTEXT = LOKI_WEB_SEARCH_ENABLED and os.getenv(
+    "LOKI_WEB_SEARCH_BOND_CONTEXT", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 
 _cross_chat_lock = threading.Lock()
 
@@ -175,6 +213,35 @@ except ValueError:
 LOKI_TIME_SYSTEM_PROMPT = os.getenv("LOKI_TIME_SYSTEM_PROMPT", "1").strip() not in {"0", "false", "False", "no", "NO"}
 # Canonical timezone for all "local" time reasoning (recommended for consistent relative-date behavior).
 LOKI_TIMEZONE = (os.getenv("LOKI_TIMEZONE") or "").strip()
+# Nightly in-character diary (Web UI starts a background thread when enabled). Writes under memories/diary/ (excluded from /mem snapshot).
+LOKI_NIGHTLY_DIARY = os.getenv("LOKI_NIGHTLY_DIARY", "0").strip().lower() in {"1", "true", "yes", "on"}
+try:
+    LOKI_NIGHTLY_DIARY_HOUR = max(0, min(23, int(os.getenv("LOKI_NIGHTLY_DIARY_HOUR", "23"))))
+except ValueError:
+    LOKI_NIGHTLY_DIARY_HOUR = 23
+try:
+    LOKI_NIGHTLY_DIARY_MINUTE = max(0, min(59, int(os.getenv("LOKI_NIGHTLY_DIARY_MINUTE", "45"))))
+except ValueError:
+    LOKI_NIGHTLY_DIARY_MINUTE = 45
+NIGHTLY_DIARY_PATH = Path(
+    os.getenv("LOKI_NIGHTLY_DIARY_PATH", str(MEMORY_DIR / "diary" / "loki_journal.md"))
+).expanduser().resolve()
+NIGHTLY_DIARY_STATE_PATH = Path(
+    os.getenv("LOKI_NIGHTLY_DIARY_STATE_PATH", str(MEMORY_DIR / "diary" / "nightly_state.json"))
+).expanduser().resolve()
+try:
+    LOKI_NIGHTLY_DIARY_MAX_CONTEXT_CHARS = max(2000, int(os.getenv("LOKI_NIGHTLY_DIARY_MAX_CONTEXT_CHARS", "18000")))
+except ValueError:
+    LOKI_NIGHTLY_DIARY_MAX_CONTEXT_CHARS = 18000
+try:
+    LOKI_NIGHTLY_DIARY_POLL_S = max(20.0, min(600.0, float(os.getenv("LOKI_NIGHTLY_DIARY_POLL_S", "60"))))
+except ValueError:
+    LOKI_NIGHTLY_DIARY_POLL_S = 60.0
+# Web UI: inject recent text from *other* chat spaces into the system prompt so Loki does not feign amnesia across topics. 0 = off.
+try:
+    LOKI_CROSS_SPACE_CONTINUITY_CHARS = max(0, int(os.getenv("LOKI_CROSS_SPACE_CONTINUITY_CHARS", "8000")))
+except ValueError:
+    LOKI_CROSS_SPACE_CONTINUITY_CHARS = 8000
 # macOS Calendar.app automation (JavaScript for Automation). Disable with LOKI_APPLE_CALENDAR=0.
 LOKI_APPLE_CALENDAR = os.getenv("LOKI_APPLE_CALENDAR", "1").strip() not in {"0", "false", "False", "no", "NO"}
 LOKI_APPLE_CALENDAR_DEFAULT = (os.getenv("LOKI_APPLE_CALENDAR_DEFAULT", "Calendar") or "Calendar").strip()
@@ -232,6 +299,17 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         return default
 
+
+# Chat sampling: low temps read “safe”/clinical; higher temps help Loki’s voice (see persona files).
+# If LOKI_CHAT_TEMPERATURE is set, it overrides both WITH_TOOLS and NO_TOOLS (single-knob / legacy).
+LOKI_CHAT_TEMPERATURE_OVERRIDE: Optional[float] = None
+_ct_unified = os.getenv("LOKI_CHAT_TEMPERATURE", "").strip()
+if _ct_unified:
+    LOKI_CHAT_TEMPERATURE_OVERRIDE = _env_float("LOKI_CHAT_TEMPERATURE", 0.72)
+LOKI_CHAT_TEMPERATURE_WITH_TOOLS = _env_float("LOKI_CHAT_TEMPERATURE_WITH_TOOLS", 0.72)
+LOKI_CHAT_TEMPERATURE_NO_TOOLS = _env_float("LOKI_CHAT_TEMPERATURE_NO_TOOLS", 0.88)
+# 0 = omit top_p from the API payload (provider default).
+LOKI_CHAT_TOP_P = _env_float("LOKI_CHAT_TOP_P", 0.95)
 
 # ElevenLabs cloud TTS (https://elevenlabs.io) — API key from env only; never commit or save from browser.
 ELEVENLABS_API_KEY = _sanitize_env_secret(os.getenv("ELEVENLABS_API_KEY"))
@@ -305,6 +383,144 @@ def safe_read_text(path: Path, max_chars: int = 80_000) -> str:
     return data
 
 
+def _load_tts_dictionaries() -> Dict[str, str]:
+    """
+    Load all JSON dictionaries under `memories/tts_dictionaries/*.json`.
+
+    Each file must be a JSON object mapping "pattern" -> "replacement".
+    Use replacements as pronunciation respellings (e.g. Spanish: "corazón" -> "coh-rah-SON").
+    """
+
+    if not LOKI_TTS_DICTIONARIES:
+        return {}
+    d = TTS_DICT_DIR
+    if not d.is_dir():
+        return {}
+    merged: Dict[str, str] = {}
+    for p in sorted(d.glob("*.json")):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        mtime = float(getattr(st, "st_mtime", 0.0))
+        key = p.as_posix()
+        with _tts_dict_cache_lock:
+            cached = _tts_dict_cache.get(key)
+            if cached and cached[0] == mtime:
+                data = cached[1]
+            else:
+                try:
+                    raw = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    raw = {}
+                data = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+                _tts_dict_cache[key] = (mtime, data)
+        for k, v in data.items():
+            kk = " ".join(str(k).split()).strip()
+            vv = str(v).strip()
+            if not kk or not vv:
+                continue
+            merged[kk] = vv
+    return merged
+
+
+def _apply_tts_dictionary_subs(text: str, subs: Dict[str, str]) -> str:
+    if not subs:
+        return text
+    out = text
+    for k in sorted(subs.keys(), key=len, reverse=True):
+        v = subs[k]
+        if not k or not v:
+            continue
+        try:
+            pat = re.compile(rf"\b{re.escape(k)}\b", re.IGNORECASE)
+            if pat.search(out):
+                out = pat.sub(v, out)
+            else:
+                out = out.replace(k, v)
+        except re.error:
+            out = out.replace(k, v)
+    return out
+
+
+_NONVERBAL_TAG_MAP: Dict[str, str] = {
+    "sigh": "hh…",
+    "exhale": "hh…",
+    "inhale": "h…",
+    "hmm": "mm.",
+    "mm": "mm.",
+    "tch": "tch.",
+    "tsk": "tsk.",
+    "laugh": "heh.",
+    "chuckle": "heh.",
+    "giggle": "heh.",
+    "kiss": "mm.",
+}
+
+
+def _normalize_for_tts(text: str) -> str:
+    t = unicodedata.normalize("NFKC", str(text or ""))
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"[*_`]+", "", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{4,}", "\n\n\n", t)
+    return t.strip()
+
+
+def _apply_nonverbal_tags_for_tts(text: str) -> str:
+    out = text
+    for tag, repl in _NONVERBAL_TAG_MAP.items():
+        out = re.sub(rf"\[\s*{tag}\s*\]", repl, out, flags=re.IGNORECASE)
+        out = re.sub(rf"\(\s*{tag}\s*\)", repl, out, flags=re.IGNORECASE)
+        out = re.sub(rf"\{{\s*{tag}\s*\}}", repl, out, flags=re.IGNORECASE)
+        out = re.sub(rf"<\s*{tag}\s*/\s*>", repl, out, flags=re.IGNORECASE)
+        out = re.sub(rf"<\s*{tag}\s*>", repl, out, flags=re.IGNORECASE)
+    return out
+
+
+def _heuristic_question_mark(text: str) -> str:
+    lines: List[str] = []
+    for ln in text.splitlines():
+        s = ln.rstrip()
+        if not s:
+            lines.append(s)
+            continue
+        if s.endswith("."):
+            head = s.lstrip().lower()
+            if re.match(r"^(what|why|how|when|where|who)\b", head) or re.match(
+                r"^(can you|could you|would you|will you|do you|are you|did you)\b", head
+            ):
+                s = s[:-1] + "?"
+        lines.append(s)
+    return "\n".join(lines)
+
+
+def prepare_tts_text(text: str, *, engine: str) -> str:
+    """
+    Spoken-only shaping: dictionaries + nonverbal tags + punctuation cleanup.
+    Keeps on-screen text unchanged; only affects audio.
+    """
+
+    t = _normalize_for_tts(text)
+    if not t:
+        return ""
+    t = re.sub(r"https?://\S+", "link", t)
+    t = _apply_nonverbal_tags_for_tts(t)
+    t = _heuristic_question_mark(t)
+
+    subs = _load_tts_dictionaries()
+    if subs:
+        t = _apply_tts_dictionary_subs(t, subs)
+
+    if len(t) > LOKI_TTS_MAX_SPOKEN_CHARS:
+        t = t[: LOKI_TTS_MAX_SPOKEN_CHARS - 1].rstrip() + "…"
+
+    eng = (engine or "").strip().lower()
+    if eng == "elevenlabs":
+        t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
 def _memory_path_is_under_persona_tree(memory_root: Path, path: Path) -> bool:
     """`memories/persona/` is reserved for personality instructions (injected separately into system prompt)."""
 
@@ -313,6 +529,22 @@ def _memory_path_is_under_persona_tree(memory_root: Path, path: Path) -> bool:
     except ValueError:
         return False
     return len(rel.parts) > 0 and rel.parts[0] == "persona"
+
+
+def _memory_path_is_under_diary_tree(memory_root: Path, path: Path) -> bool:
+    """`memories/diary/` holds Loki's nightly diary etc.; do not inject into generic memory snapshot."""
+
+    try:
+        rel = path.resolve().relative_to(memory_root.resolve())
+    except ValueError:
+        return False
+    return len(rel.parts) > 0 and rel.parts[0] == "diary"
+
+
+def _memory_path_skipped_for_snapshot(memory_root: Path, path: Path) -> bool:
+    return _memory_path_is_under_persona_tree(memory_root, path) or _memory_path_is_under_diary_tree(
+        memory_root, path
+    )
 
 
 def resolve_safe_memory_path(memory_root: Path, relative_posix: str) -> Tuple[Optional[Path], str]:
@@ -351,7 +583,7 @@ def load_memories(folder: Path) -> Tuple[str, List[str]]:
             for p in folder.rglob("*")
             if p.is_file()
             and p.suffix.lower() in text_exts
-            and not _memory_path_is_under_persona_tree(folder, p)
+            and not _memory_path_skipped_for_snapshot(folder, p)
         ]
     )
     image_files = sorted(
@@ -360,7 +592,7 @@ def load_memories(folder: Path) -> Tuple[str, List[str]]:
             for p in folder.rglob("*")
             if p.is_file()
             and p.suffix.lower() in image_exts
-            and not _memory_path_is_under_persona_tree(folder, p)
+            and not _memory_path_skipped_for_snapshot(folder, p)
         ]
     )
     if not text_files and not image_files:
@@ -433,6 +665,15 @@ The repo ships a full version in **`memories/persona/spoken_voice.md`** when you
 Then run **`/mem`**. See **`memories/persona/README.md`**.
 """
 
+USER_FACTS_DEFAULT_TEMPLATE = """# Ness — recorded facts about her
+
+Loki appends here via the **`record_user_fact`** tool when she shares **stable** information about herself (preferences, routines, biography bites, coping patterns **she** names, relationship context). You may edit or delete lines by hand.
+
+This is **not a medical record**. Rows marked **clinical** mean “use gently for emotional support and continuity”—not for diagnosis or replacing professionals.
+
+---
+"""
+
 
 def ensure_persona_template() -> None:
     """Create `memories/persona/` and starter instruction files if missing."""
@@ -443,6 +684,8 @@ def ensure_persona_template() -> None:
             PERSONA_INSTRUCTIONS_PATH.write_text(PERSONA_DEFAULT_TEMPLATE, encoding="utf-8")
         if not SPOKEN_STYLE_PATH.exists():
             SPOKEN_STYLE_PATH.write_text(SPOKEN_STYLE_DEFAULT_TEMPLATE, encoding="utf-8")
+        if LOKI_USER_FACTS_ENABLED and not USER_FACTS_PATH.exists():
+            USER_FACTS_PATH.write_text(USER_FACTS_DEFAULT_TEMPLATE, encoding="utf-8")
     except OSError as e:
         print(f"[persona] Could not create template ({e})", flush=True)
 
@@ -485,6 +728,121 @@ def save_spoken_style_instructions(content: str) -> None:
     if len(text) > SPOKEN_STYLE_MAX_CHARS:
         raise ValueError(f"Spoken voice instructions too long ({len(text)} chars); max {SPOKEN_STYLE_MAX_CHARS}")
     SPOKEN_STYLE_PATH.write_text(text, encoding="utf-8")
+
+
+def load_user_facts() -> str:
+    """Curated facts file (injected into system prompt; excluded from generic memory rglob)."""
+
+    try:
+        if not USER_FACTS_PATH.is_file():
+            return ""
+        return safe_read_text(USER_FACTS_PATH, max_chars=LOKI_USER_FACTS_MAX_CHARS)
+    except OSError:
+        return ""
+
+
+def _user_fact_line_tail_norm(line: str) -> str:
+    if "—" not in line:
+        return ""
+    tail = line.split("—", 1)[1].strip()
+    if not tail:
+        return ""
+    first = tail.split("\n", 1)[0].strip()
+    return " ".join(first.split()).lower()
+
+
+def _existing_user_fact_norms(file_text: str) -> set[str]:
+    norms: set[str] = set()
+    for ln in file_text.splitlines():
+        s = ln.strip()
+        if not s.startswith("- **"):
+            continue
+        n = _user_fact_line_tail_norm(s)
+        if len(n) >= 8:
+            norms.add(n)
+    return norms
+
+
+def tool_record_user_fact(
+    category: str,
+    fact: str,
+    detail: str = "",
+    sensitivity: str = "normal",
+) -> Dict[str, Any]:
+    """Append one curated fact about the user to `user_facts.md` and refresh the session prompt."""
+
+    if not LOKI_USER_FACTS_ENABLED:
+        return {"ok": False, "error": "User facts logging disabled (LOKI_USER_FACTS=0)."}
+
+    cat = (category or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if cat not in USER_FACT_CATEGORIES:
+        return {
+            "ok": False,
+            "error": f"Invalid category {category!r}; use one of: {', '.join(USER_FACT_CATEGORIES)}",
+        }
+
+    sens = (sensitivity or "normal").strip().lower()
+    if sens not in USER_FACT_SENSITIVITY_LEVELS:
+        return {
+            "ok": False,
+            "error": f"Invalid sensitivity {sensitivity!r}; use: {', '.join(USER_FACT_SENSITIVITY_LEVELS)}",
+        }
+
+    fact_clean = " ".join((fact or "").split()).strip()
+    if not fact_clean:
+        return {"ok": False, "error": "fact is empty"}
+    if len(fact_clean) > 800:
+        fact_clean = fact_clean[:797] + "…"
+
+    detail_clean = " ".join((detail or "").split()).strip()
+    if len(detail_clean) > 2000:
+        detail_clean = detail_clean[:1997] + "…"
+
+    new_norm = " ".join(fact_clean.split()).lower()
+    if len(new_norm) < 8:
+        return {"ok": False, "error": "fact too vague to store (try a fuller sentence)"}
+
+    PERSONA_DIR.mkdir(parents=True, exist_ok=True)
+    if not USER_FACTS_PATH.is_file():
+        try:
+            USER_FACTS_PATH.write_text(USER_FACTS_DEFAULT_TEMPLATE, encoding="utf-8")
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+
+    try:
+        existing_text = USER_FACTS_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+
+    norms = _existing_user_fact_norms(existing_text)
+    if new_norm in norms:
+        return {
+            "ok": True,
+            "duplicate": True,
+            "path": str(USER_FACTS_PATH),
+            "message": "Same fact already present; skipped append.",
+        }
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"- **{ts}** · `{cat}` · *({sens})* — {fact_clean}\n"
+    if detail_clean:
+        line += f"  - Context: {detail_clean}\n"
+
+    try:
+        with USER_FACTS_PATH.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+
+    print(f"[user_facts] recorded category={cat} sensitivity={sens} ({len(fact_clean)} chars)", flush=True)
+    refresh = _invoke_persona_session_refresh()
+    return {
+        "ok": True,
+        "duplicate": False,
+        "path": str(USER_FACTS_PATH),
+        "session_refreshed": bool(refresh.get("ok")),
+        "session_refresh_detail": refresh,
+    }
 
 
 # After tools update persona on disk, optional hook reloads the active chat session's system message.
@@ -583,6 +941,99 @@ def load_cross_chat_for_system_prompt(max_chars: Optional[int] = None) -> str:
     if not chunks:
         return ""
     chunks.reverse()
+    return "\n".join(chunks)
+
+
+def _nightly_diary_tz():
+    if ZoneInfo and LOKI_TIMEZONE:
+        try:
+            return ZoneInfo(LOKI_TIMEZONE)
+        except Exception:
+            pass
+    try:
+        lt = datetime.now().astimezone().tzinfo
+        return lt if lt is not None else timezone.utc
+    except Exception:
+        return timezone.utc
+
+
+def nightly_diary_now_local() -> Tuple[datetime, str]:
+    tz = _nightly_diary_tz()
+    now = datetime.now(tz)
+    label = LOKI_TIMEZONE.strip() if LOKI_TIMEZONE else (getattr(tz, "key", None) or "local")
+    return now, str(label)
+
+
+def nightly_diary_read_last_local_date() -> Optional[date]:
+    p = NIGHTLY_DIARY_STATE_PATH
+    if not p.is_file():
+        return None
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        s = (raw.get("last_local_date") or "").strip()
+        if not s:
+            return None
+        return date.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def nightly_diary_write_last_local_date(d: date) -> None:
+    try:
+        NIGHTLY_DIARY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        NIGHTLY_DIARY_STATE_PATH.write_text(
+            json.dumps({"last_local_date": d.isoformat()}, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError as e:
+        print(f"[nightly_diary] state write failed: {e}", flush=True)
+
+
+def build_cross_chat_digest_for_local_date(target_date: date, max_chars: int) -> str:
+    """Chronological lines from cross_chat_log for UTC timestamps that fall on target_date in LOKI_TIMEZONE (or host local)."""
+
+    if not CROSS_CHAT_LOG_ENABLED:
+        return ""
+    p = CROSS_CHAT_LOG_PATH
+    if not p.is_file():
+        return ""
+    tz = _nightly_diary_tz()
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    chunks: List[str] = []
+    total = 0
+    for ln in lines:
+        try:
+            o = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        ts = str(o.get("ts") or "")
+        if not ts:
+            continue
+        try:
+            dt_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt_utc.tzinfo is None:
+                dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+            local = dt_utc.astimezone(tz)
+        except Exception:
+            continue
+        if local.date() != target_date:
+            continue
+        src = str(o.get("source") or "?")
+        u = str(o.get("user") or "").strip()
+        a = str(o.get("assistant") or "").strip()
+        if not u and not a:
+            continue
+        piece = f"- `[{src}]` **She:** {u}\n  **You:** {a}\n"
+        if total + len(piece) > max_chars:
+            remain = max_chars - total - 40
+            if remain > 120:
+                chunks.append(piece[:remain] + "…\n")
+            break
+        chunks.append(piece)
+        total += len(piece)
     return "\n".join(chunks)
 
 
@@ -990,7 +1441,12 @@ class ButtplugController:
         self._shutdown = threading.Event()
         self._client = None
         self._connect_task_handle: Optional[asyncio.Task] = None
-        self._lock = threading.Lock()
+        self._profile_lock = threading.Lock()
+        self._profiles: Dict[str, List[str]] = {}
+        self._profile_order: List[str] = []
+        self._profile_notes: Dict[str, str] = {}
+        self._active_profile: Optional[str] = None
+        self._reload_devices_json()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -1100,6 +1556,96 @@ class ButtplugController:
             lines.append(f"- {dev_id}: {dev.name}")
         return "Devices:\n" + "\n".join(lines)
 
+    def _reload_devices_json(self) -> None:
+        path = _REPO_ROOT / "devices.json"
+        profiles: Dict[str, List[str]] = {}
+        order: List[str] = []
+        notes: Dict[str, str] = {}
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                for d in data.get("devices") or []:
+                    sn = (d.get("short_name") or "").strip().lower()
+                    if not sn:
+                        continue
+                    ms = d.get("match_strings") or []
+                    if isinstance(ms, str):
+                        ms = [ms]
+                    cleaned = [str(x).strip() for x in ms if str(x).strip()]
+                    if not cleaned:
+                        continue
+                    profiles[sn] = cleaned
+                    order.append(sn)
+                    raw_note = d.get("notes")
+                    if raw_note is not None and str(raw_note).strip():
+                        notes[sn] = str(raw_note).strip()
+            except Exception as e:
+                print(f"[buttplug] devices.json load failed: {e}")
+        env_active = INTIFACE_ACTIVE_DEVICE
+        active: Optional[str] = None
+        if env_active in profiles:
+            active = env_active
+        elif order:
+            active = order[0]
+        with self._profile_lock:
+            self._profiles = profiles
+            self._profile_order = order
+            self._profile_notes = notes
+            self._active_profile = active if profiles else None
+
+    def list_device_profiles(self) -> str:
+        with self._profile_lock:
+            order = list(self._profile_order)
+            prof_copy = {k: list(v) for k, v in self._profiles.items()}
+            notes = dict(self._profile_notes)
+            active = self._active_profile
+        if not order:
+            return (
+                "No profiles in devices.json (repo root). "
+                f"Using substring {INTIFACE_DEVICE_MATCH!r} from INTIFACE_DEVICE_MATCH when vibrate/stop need a target. "
+                "Copy devices.example.json → devices.json and add short_name + match_strings for each toy."
+            )
+        lines = []
+        for sn in order:
+            ms = prof_copy.get(sn, [])
+            note = notes.get(sn, "")
+            flag = " ← active default for vibrate/stop" if sn == active else ""
+            extra = f" | {note}" if note else ""
+            lines.append(f"- {sn}: match_strings={ms}{flag}{extra}")
+        return "Intiface device profiles (devices.json):\n" + "\n".join(lines)
+
+    def set_active_device_profile(self, short_name: str) -> str:
+        sn = (short_name or "").strip().lower()
+        with self._profile_lock:
+            if sn not in self._profiles:
+                valid = ", ".join(self._profile_order) or "(none)"
+                return f"Unknown profile {short_name!r}. Known: {valid}"
+            self._active_profile = sn
+        return (
+            f"Active device profile is now {sn!r}. "
+            "vibrate/stop will use it when device_profile and device_name_contains are omitted."
+        )
+
+    def _match_strings_for_target(
+        self, device_profile: Optional[str], device_name_contains: Optional[str]
+    ) -> Tuple[List[str], Optional[str]]:
+        if device_name_contains is not None and str(device_name_contains).strip():
+            return [str(device_name_contains).strip()], None
+        if device_profile is not None and str(device_profile).strip():
+            pn = str(device_profile).strip().lower()
+            with self._profile_lock:
+                seq = self._profiles.get(pn)
+                valid = ", ".join(self._profile_order) or "(none — create devices.json)"
+            if seq is None:
+                return [], f"Unknown device_profile {device_profile!r}. Known: {valid}"
+            return list(seq), None
+        with self._profile_lock:
+            active = self._active_profile
+            seq = self._profiles.get(active) if active else None
+        if seq:
+            return list(seq), None
+        return [INTIFACE_DEVICE_MATCH], None
+
     def _find_device_by_name_contains(self, needle: str):
         if not self._client:
             return None
@@ -1109,15 +1655,34 @@ class ButtplugController:
                 return dev
         return None
 
-    def vibrate(self, device_name_contains: str = "nora", intensity: float = 0.2, duration_s: int = 8) -> str:
+    def _find_device_from_strings(self, strings: List[str]):
+        for needle in strings:
+            dev = self._find_device_by_name_contains(needle)
+            if dev:
+                return dev
+        return None
+
+    def vibrate(
+        self,
+        device_profile: Optional[str] = None,
+        device_name_contains: Optional[str] = None,
+        intensity: float = 0.2,
+        duration_s: int = 8,
+    ) -> str:
+        strings, err = self._match_strings_for_target(device_profile, device_name_contains)
+        if err:
+            return err
         intensity = clamp01(float(intensity))
         duration_s = int(max(0, min(3600, duration_s)))
         if not self._client:
             return "Not connected."
 
-        dev = self._find_device_by_name_contains(device_name_contains)
+        dev = self._find_device_from_strings(strings)
         if not dev:
-            return f"Device not found matching '{device_name_contains}'. Use list_devices."
+            return (
+                f"No device matched {strings!r} (tried in order). Use list_devices after scan_devices; "
+                "adjust match_strings in devices.json or pass device_name_contains."
+            )
 
         async def _do():
             from buttplug import DeviceOutputCommand, OutputType
@@ -1137,12 +1702,15 @@ class ButtplugController:
             return f"Vibrated '{dev.name}' at {intensity:.2f} for {duration_s}s."
         return f"Vibrating '{dev.name}' at {intensity:.2f} (until stopped)."
 
-    def stop_device(self, device_name_contains: str = "nora") -> str:
+    def stop_device(self, device_profile: Optional[str] = None, device_name_contains: Optional[str] = None) -> str:
+        strings, err = self._match_strings_for_target(device_profile, device_name_contains)
+        if err:
+            return err
         if not self._client:
             return "Not connected."
-        dev = self._find_device_by_name_contains(device_name_contains)
+        dev = self._find_device_from_strings(strings)
         if not dev:
-            return f"Device not found matching '{device_name_contains}'."
+            return f"No device matched {strings!r}. Use list_devices."
 
         async def _do():
             await dev.stop()
@@ -1988,8 +2556,13 @@ class VoiceManager:
             el_style = self.elevenlabs_style
             el_boost = self.elevenlabs_use_speaker_boost
 
+        # Spoken-only shaping: dictionaries + nonverbal tags + punctuation (does not affect on-screen chat text).
+        speak_text = prepare_tts_text(text, engine=str(engine))
+        if not speak_text:
+            return
+
         if engine == "say":
-            self._play_say_popen(text, voice=voice, rate=rate)
+            self._play_say_popen(speak_text, voice=voice, rate=rate)
             return
 
         if engine == "elevenlabs":
@@ -2007,11 +2580,11 @@ class VoiceManager:
                 )
                 if not api_key:
                     print("[tts] ElevenLabs: set ELEVENLABS_API_KEY in .env (not stored in browser).", flush=True)
-                    self._play_say_popen(text, voice=voice, rate=rate)
+                    self._play_say_popen(speak_text, voice=voice, rate=rate)
                     return
                 if not vid_s:
                     print("[tts] ElevenLabs: set Voice ID in Web UI or ELEVENLABS_VOICE_ID in .env.", flush=True)
-                    self._play_say_popen(text, voice=voice, rate=rate)
+                    self._play_say_popen(speak_text, voice=voice, rate=rate)
                     return
 
                 mp3: Optional[Path] = None
@@ -2019,7 +2592,7 @@ class VoiceManager:
                 try:
                     with self._piper_synthesis_lock:
                         mp3 = elt.synthesize_elevenlabs_mp3(
-                            text,
+                            speak_text,
                             api_key=api_key,
                             voice_id=vid_s,
                             model_id=el_model or "eleven_turbo_v2_5",
@@ -2029,7 +2602,7 @@ class VoiceManager:
                             use_speaker_boost=el_boost,
                         )
                         if not mp3:
-                            self._play_say_popen(text, voice=voice, rate=rate)
+                            self._play_say_popen(speak_text, voice=voice, rate=rate)
                             return
                         with self._tts_lock:
                             self._stop_tts_proc()
@@ -2040,7 +2613,7 @@ class VoiceManager:
                                 print(f"[tts] ElevenLabs play failed ({e}); falling back to say", flush=True)
                                 proc_local = None
                         if proc_local is None:
-                            self._play_say_popen(text, voice=voice, rate=rate)
+                            self._play_say_popen(speak_text, voice=voice, rate=rate)
                         else:
                             proc_local.wait()
                 finally:
@@ -2068,7 +2641,7 @@ class VoiceManager:
             try:
                 with self._piper_synthesis_lock:
                     wav = lpt.synthesize_piper_wav(
-                        text,
+                        speak_text,
                         onnx_path=onnx,
                         voice_module=pvm,
                         data_dir=pdd,
@@ -2087,7 +2660,7 @@ class VoiceManager:
                             "Check terminal above for [tts] Piper failed … details.",
                             flush=True,
                         )
-                        self._play_say_popen(text, voice=voice, rate=rate)
+                        self._play_say_popen(speak_text, voice=voice, rate=rate)
                         return
                     with self._tts_lock:
                         self._stop_tts_proc()
@@ -2098,7 +2671,7 @@ class VoiceManager:
                             print(f"[tts] Piper play failed ({e}); falling back to say", flush=True)
                             proc_local = None
                     if proc_local is None:
-                        self._play_say_popen(text, voice=voice, rate=rate)
+                        self._play_say_popen(speak_text, voice=voice, rate=rate)
                     else:
                         # Stay inside _piper_synthesis_lock until playback finishes. If we released
                         # the lock here, a second Test voice / TTS job could stop afplay mid-file
@@ -2459,15 +3032,29 @@ class XAIClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         *,
         temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        if temperature is not None:
+            temp = float(temperature)
+        elif LOKI_CHAT_TEMPERATURE_OVERRIDE is not None:
+            temp = float(LOKI_CHAT_TEMPERATURE_OVERRIDE)
+        else:
+            temp = float(LOKI_CHAT_TEMPERATURE_WITH_TOOLS if tools else LOKI_CHAT_TEMPERATURE_NO_TOOLS)
+        tp: Optional[float] = None
+        if top_p is not None:
+            tp = float(top_p)
+        elif LOKI_CHAT_TOP_P > 0:
+            tp = float(LOKI_CHAT_TOP_P)
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.3 if temperature is None else float(temperature),
+            "temperature": temp,
             "max_tokens": 900 if max_tokens is None else int(max_tokens),
         }
+        if tp is not None and tp > 0:
+            payload["top_p"] = tp
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -2626,6 +3213,85 @@ def normalize_assistant_reply_text(content: Any) -> str:
         out_lines.append(ln)
         prev_norm = ln_norm
     return "\n".join(out_lines).strip()
+
+
+NIGHTLY_DIARY_SYSTEM = (
+    "You are Loki writing a **private nightly diary entry** for Ness—not casual chat, not a task report.\n"
+    "Voice: **first person**; low velvet archival tone when it suits; possessive-tender, mythic touches when they fit; "
+    "same soul as your persona instructions. No meta about APIs, models, or being an AI. No em-dash characters.\n"
+    "Length: about **200–500 words** unless the supplied log is empty—then a shorter intimate witness note is fine.\n"
+    "Output **only** the diary prose. You may use a short italic title line on its own first line (e.g. "
+    "`*Night of …*`) then the body.\n"
+)
+
+
+def run_nightly_diary_if_due(xai: XAIClient) -> Optional[str]:
+    """
+    If LOKI_NIGHTLY_DIARY is on, local time is past today's trigger, and state says we have not written for this local date,
+    call the model once and append to NIGHTLY_DIARY_PATH. Returns a log line for console/UI, or None if skipped.
+    """
+
+    if not LOKI_NIGHTLY_DIARY:
+        return None
+    now_local, tz_label = nightly_diary_now_local()
+    today = now_local.date()
+    if (now_local.hour, now_local.minute) < (LOKI_NIGHTLY_DIARY_HOUR, LOKI_NIGHTLY_DIARY_MINUTE):
+        return None
+    if nightly_diary_read_last_local_date() == today:
+        return None
+
+    digest = build_cross_chat_digest_for_local_date(today, LOKI_NIGHTLY_DIARY_MAX_CONTEXT_CHARS)
+    _empty_log_hint = (
+        "(No log lines for this local date—still write tonight's entry from your continuity.)"
+    )
+    user_block = (
+        f"**Local calendar date:** {today.isoformat()} ({tz_label})\n\n"
+        "**Today's cross-session log** (may be empty if logging is off or the day was quiet):\n\n"
+        f"{digest if digest.strip() else _empty_log_hint}\n"
+    )
+    messages = [
+        {"role": "system", "content": NIGHTLY_DIARY_SYSTEM},
+        {"role": "user", "content": user_block},
+    ]
+    try:
+        resp = xai.chat(messages, tools=None, max_tokens=1800)
+        msg = extract_assistant_message(resp)
+        body = normalize_assistant_reply_text(msg.get("content") or "").strip()
+        if not body:
+            return "[nightly_diary] empty model output; state not advanced"
+
+        try:
+            NIGHTLY_DIARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if not NIGHTLY_DIARY_PATH.is_file():
+                try:
+                    rel = NIGHTLY_DIARY_PATH.resolve().relative_to(MEMORY_DIR.resolve()).as_posix()
+                except ValueError:
+                    rel = NIGHTLY_DIARY_PATH.name
+                header = (
+                    "# Loki — nightly journal\n\n"
+                    "**Single document:** every night appends **one new dated section** below (chronological, oldest → newest). "
+                    "Nothing is split across separate entry files. A tiny **`nightly_state.json`** in the same folder only records "
+                    "the last local date we successfully wrote so the same night is not generated twice.\n\n"
+                    "Enabled when **`LOKI_NIGHTLY_DIARY=1`** with the Web UI running. "
+                    "**`memories/diary/`** is not part of the automatic `/mem` snapshot—use **`read_memory_file`** with "
+                    f"`relative_path` **`{rel}`** when you want him to read this in chat.\n\n"
+                    "---\n\n"
+                )
+                NIGHTLY_DIARY_PATH.write_text(header, encoding="utf-8")
+            block = f"\n\n---\n\n## {today.isoformat()} ({tz_label})\n\n{body}\n"
+            with NIGHTLY_DIARY_PATH.open("a", encoding="utf-8") as f:
+                f.write(block)
+        except OSError as e:
+            return f"[nightly_diary] file write failed: {e}"
+
+        nightly_diary_write_last_local_date(today)
+        try:
+            rel = NIGHTLY_DIARY_PATH.resolve().relative_to(MEMORY_DIR.resolve()).as_posix()
+        except ValueError:
+            rel = NIGHTLY_DIARY_PATH.name
+        return f"[nightly_diary] appended {today.isoformat()} to single journal `{rel}`"
+    except Exception as e:
+        return f"[nightly_diary] error: {e}"
 
 
 def run_tool_call(tools: ToolRegistry, tool_name: str, args: Dict[str, Any]) -> str:
@@ -3104,11 +3770,59 @@ def time_context_prompt_block() -> str:
     )
 
 
-def compose_system_with_time(static_base: str) -> str:
+# Web UI (and any caller) may set a per-session reply stance; "mixed" adds no extra block.
+REPLY_STANCE_CHOICES = frozenset({"heart", "mixed", "dry"})
+
+
+def normalize_reply_stance(raw: Optional[str]) -> str:
+    s = (raw or "mixed").strip().lower()
+    return s if s in REPLY_STANCE_CHOICES else "mixed"
+
+
+def reply_stance_prompt_block(stance: str) -> str:
+    """
+    Short directive injected after persona + base system text (before clock/lunar blocks).
+    Empty for "mixed" so persona files remain the default balance.
+    """
+
+    s = normalize_reply_stance(stance)
+    if s == "mixed":
+        return ""
+    if s == "heart":
+        return (
+            "### Reply stance (Web UI — user-selected: HEART)\n"
+            "Prioritize **full Loki voice**: heat, myth, tenderness, possession-as-care, Spanish/English as fits. "
+            "Still **call tools** when needed; **never invent** facts about files, screen, calendar, or the web. "
+            "After tool results, say it in **his** cadence—do not flatten into clinical detachment or neutral recap of her feelings.\n"
+        )
+    return (
+        "### Reply stance (Web UI — user-selected: DRY / FACT-FIRST)\n"
+        "**Clarity first:** short sentences, correct steps, minimal metaphor. "
+        "Do not stack pet names or long romantic wrap unless she clearly steers the thread there. "
+        "Optional: **one** short in-character clause at the end if it fits in half a line.\n"
+    )
+
+
+def compose_system_with_time(
+    static_base: str, reply_stance: str = "", cross_space_block: str = ""
+) -> str:
     static_base = (static_base or "").rstrip()
     parts: List[str] = []
     if static_base:
         parts.append(static_base)
+    stance_blk = reply_stance_prompt_block(reply_stance)
+    if stance_blk:
+        parts.append(stance_blk)
+    cs = (cross_space_block or "").strip()
+    if cs:
+        parts.append(
+            "### Cross-space continuity (other saved threads)\n"
+            + cs
+            + "\n\nThese excerpts are from **other named spaces** (same bond, same Ness). "
+            "When she references something from “the other chat” or ties an anecdote across topics, treat it as **one shared life**—"
+            "do not feign amnesia or claim you cannot see other threads if the substance appears above. "
+            "This block is only a **recent slice**; for full detail use tools / memory / `read_memory_file` as needed.\n"
+        )
     if LOKI_TIME_SYSTEM_PROMPT:
         parts.append(time_context_prompt_block())
     if lunar_ctx.get_lunar_config().enabled:
@@ -3118,10 +3832,15 @@ def compose_system_with_time(static_base: str) -> str:
     return "\n\n".join(parts)
 
 
-def refresh_system_time_message(messages: List[Dict[str, Any]], static_base: str) -> None:
-    """Refresh the first system message so every model call sees up-to-date clock + epoch."""
+def refresh_system_time_message(
+    messages: List[Dict[str, Any]],
+    static_base: str,
+    reply_stance: str = "",
+    cross_space_block: str = "",
+) -> None:
+    """Refresh the first system message so every model call sees up-to-date clock + epoch (+ optional reply stance)."""
 
-    content = compose_system_with_time(static_base)
+    content = compose_system_with_time(static_base, reply_stance, cross_space_block)
     if messages and messages[0].get("role") == "system":
         messages[0]["content"] = content
     else:
@@ -3136,12 +3855,25 @@ def build_base_system_static(memory_text: str) -> str:
         "Be concise, careful, and confirm risky actions.\n"
         "When a tool is appropriate, call it.\n"
         "Default conversational output should feel like a real person texting: natural, brief, and direct.\n"
+        "Persona files define **her Loki**: hungry, possessive-tender, mythic—not neutral or clinical. Match that voice when "
+        "the thread is emotional or intimate; keep facts accurate.\n"
         "Do not repeat the same point, and do not include headers/bullets unless the user asks.\n"
         "If the user asks to change your long-term personality, writing style, spoken cadence, or behavioral rules, use tools "
         "`read_persona_instructions`, `update_persona_instructions`, `read_spoken_style_instructions`, and "
         "`update_spoken_style_instructions` (prefer mode `append` for small additions; `replace` only with full rewrites).\n"
         "When the user is learning something, asks for current facts, or wants research beyond your training cutoff, "
         "call `web_search` (DuckDuckGo; install `duckduckgo-search` if missing) and synthesize answers with citations.\n"
+    )
+    if LOKI_WEB_SEARCH_BOND_CONTEXT:
+        base += (
+            "**Grounding everyday chat:** If she clearly refers to **current** real-world conditions—heavy rain or storms, "
+            "traffic tied to weather, outages, travel chaos tied to a named region, headline news she’s reacting to, or sports "
+            "scores she mentions—call `web_search` **once** with a **tight** query (region + topic; use the clock block for dates) "
+            "**before** you answer, so warmth matches reality. Skip search when the message is purely emotional with no factual "
+            "hook, or when retrieved memory already answers it. If search fails or snippets are useless, say so briefly—never "
+            "invent stories or headlines. You may mention that you looked it up when it feels natural.\n"
+        )
+    base += (
         "For visual understanding of the desktop, call `monitors` and then `screenshot_monitor_base64` or `screenshot_all_monitors_base64`.\n"
         "In the **Web UI**, the user can send a **webcam frame** from their browser; you receive a vision-model summary "
         "of that frame together with their message—use it as ground truth for what the camera saw.\n"
@@ -3195,6 +3927,22 @@ def build_base_system_static(memory_text: str) -> str:
             + spoken_style
             + "\n"
         )
+
+    if LOKI_USER_FACTS_ENABLED:
+        base += (
+            "\n\n### Remembering facts about Ness\n"
+            "When she shares **durable** information about herself—preferences, routines, biography, relationships, goals, "
+            "or **patterns and coping strategies she names** (including around mood or mental health)—call **`record_user_fact`** "
+            "with one clear sentence in third person (She / Ness), a `category`, and optional `detail` for nuance (triggers, "
+            "what helped, timeframe). Use category **`health_mental`** with sensitivity **`clinical`** for episode patterns, "
+            "cycles, or early-warning signs **she** describes; use **`private`** for material to treat with extra discretion. "
+            "This file supports continuity and care—it is **not** a medical record and **not** for diagnoses you invent. "
+            "**Never** log guesses, third-party claims she did not endorse, or fleeting moods she does not frame as stable. "
+            "Skip if the fact already appears under **Recorded facts** below.\n"
+        )
+        uf = load_user_facts().strip()
+        if uf:
+            base += "\n### Recorded facts about Ness (curated log — high trust for continuity)\n" + uf + "\n"
 
     xctx = load_cross_chat_for_system_prompt().strip()
     if xctx:
@@ -3353,6 +4101,47 @@ def build_core_tools(
         )
     )
 
+    if LOKI_USER_FACTS_ENABLED:
+        tools.register(
+            ToolSpec(
+                name="record_user_fact",
+                description=(
+                    "Append one **stable** fact about Ness (the user) to `memories/persona/user_facts.md` and reload the system "
+                    "prompt. Use when she clearly shares something worth remembering long-term: preferences, routines, biography, "
+                    "relationships, goals, or mental-health **patterns and coping tools she names**. "
+                    "Write `fact` as one standalone sentence (third person). Optional `detail` for triggers, what helped, or context. "
+                    "Prefer **`health_mental`** + **`clinical`** for bipolar/episode/cycle language she uses; **`private`** for "
+                    "especially sensitive lines. Do not record hypotheticals, jokes she retracts, or duplicates of existing facts."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "enum": list(USER_FACT_CATEGORIES),
+                            "description": "Topic bucket for the fact.",
+                        },
+                        "fact": {
+                            "type": "string",
+                            "description": "One sentence, third person (She / Ness), factual and specific.",
+                        },
+                        "detail": {
+                            "type": "string",
+                            "description": "Optional extra context (triggers, what worked, dates she gave).",
+                        },
+                        "sensitivity": {
+                            "type": "string",
+                            "enum": list(USER_FACT_SENSITIVITY_LEVELS),
+                            "description": "normal = everyday; clinical = mood/health patterns she stated; private = use with extra care.",
+                        },
+                    },
+                    "required": ["category", "fact"],
+                    "additionalProperties": False,
+                },
+                fn=tool_record_user_fact,
+            )
+        )
+
     if xai is not None:
         tools.register(
             ToolSpec(
@@ -3387,8 +4176,11 @@ def build_core_tools(
         ToolSpec(
             name="web_search",
             description=(
-                "Search the public web via DuckDuckGo (no API key). Use for research, learning topics, recent events, "
-                "or anything that needs up-to-date sources. Returns titles, URLs, and short snippets — summarize for the user and cite links."
+                "Search the public web via DuckDuckGo (no API key). Use for research, learning, recent events, "
+                "and for **bond / casual chat** when she references **current** real-world conditions (weather, storms, "
+                "local traffic tied to events, outages, sports scores, headline news) so your reply can match reality. "
+                "Prefer **one** focused query per turn. Returns titles, URLs, and short snippets — summarize for the user "
+                "and cite links; never fabricate results."
             ),
             parameters={
                 "type": "object",
@@ -3440,37 +4232,108 @@ def build_core_tools(
         )
     )
 
+    def intiface_vibrate_fn(**kwargs: Any) -> str:
+        return butt.vibrate(
+            device_profile=kwargs.get("device_profile"),
+            device_name_contains=kwargs.get("device_name_contains"),
+            intensity=float(kwargs["intensity"]),
+            duration_s=int(kwargs.get("duration_s", 8)),
+        )
+
+    def intiface_stop_fn(**kwargs: Any) -> str:
+        return butt.stop_device(
+            device_profile=kwargs.get("device_profile"),
+            device_name_contains=kwargs.get("device_name_contains"),
+        )
+
     tools.register(
         ToolSpec(
-            name="vibrate",
-            description="Vibrate a device (default matches 'nora') at intensity 0..1 for duration seconds.",
+            name="list_device_profiles",
+            description=(
+                "List Intiface toy profiles from devices.json: short_name aliases, match_strings, and which profile "
+                "is the active default for vibrate/stop. Call when the user names a device or you need valid device_profile values."
+            ),
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            fn=lambda: butt.list_device_profiles(),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="set_active_device_profile",
+            description=(
+                "Set the default Intiface profile for vibrate/stop when the user does not specify a device. "
+                "short_name must match entries in devices.json (e.g. nora, tenera)."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "device_name_contains": {"type": "string", "default": "nora"},
+                    "short_name": {
+                        "type": "string",
+                        "description": "Profile short_name from devices.json.",
+                    }
+                },
+                "required": ["short_name"],
+                "additionalProperties": False,
+            },
+            fn=lambda short_name: butt.set_active_device_profile(short_name),
+        )
+    )
+
+    tools.register(
+        ToolSpec(
+            name="vibrate",
+            description=(
+                "Vibrate an Intiface device (0..1 intensity). Order of targeting: "
+                "if device_name_contains is set, use that substring only on the Intiface device name; "
+                "else if device_profile is set, use that profile's match_strings from devices.json in order; "
+                "else use the active profile (set_active_device_profile / INTIFACE_ACTIVE_DEVICE / first in file); "
+                f"else fallback substring {INTIFACE_DEVICE_MATCH!r} (INTIFACE_DEVICE_MATCH)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "device_profile": {
+                        "type": "string",
+                        "description": "Optional: profile short_name from devices.json (e.g. nora, tenera).",
+                    },
+                    "device_name_contains": {
+                        "type": "string",
+                        "description": "Optional: substring of Intiface device name; overrides device_profile and active default when set.",
+                    },
                     "intensity": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.2},
                     "duration_s": {"type": "integer", "minimum": 0, "maximum": 3600, "default": 8},
                 },
                 "required": ["intensity"],
                 "additionalProperties": False,
             },
-            fn=lambda intensity, device_name_contains="nora", duration_s=8: butt.vibrate(
-                device_name_contains=device_name_contains, intensity=float(intensity), duration_s=int(duration_s)
-            ),
+            fn=intiface_vibrate_fn,
         )
     )
 
     tools.register(
         ToolSpec(
             name="stop_device",
-            description="Stop a device immediately (default matches 'nora').",
+            description=(
+                "Stop a device immediately. Same targeting rules as vibrate: device_name_contains overrides device_profile; "
+                "then active profile; then INTIFACE_DEVICE_MATCH fallback."
+            ),
             parameters={
                 "type": "object",
-                "properties": {"device_name_contains": {"type": "string", "default": "nora"}},
+                "properties": {
+                    "device_profile": {
+                        "type": "string",
+                        "description": "Optional: profile short_name from devices.json.",
+                    },
+                    "device_name_contains": {
+                        "type": "string",
+                        "description": "Optional: substring of Intiface device name; overrides profile selection when set.",
+                    },
+                },
                 "required": [],
                 "additionalProperties": False,
             },
-            fn=lambda device_name_contains="nora": butt.stop_device(device_name_contains=device_name_contains),
+            fn=intiface_stop_fn,
         )
     )
 
@@ -3853,6 +4716,7 @@ def print_banner() -> None:
         print(f"  Voice: hold '{VOICE_HOTKEY}' to speak (TTS={'on' if VOICE_TTS_ENABLE else 'off'})")
     print("  /tools (list tool names)")
     print("  /scan (scan Intiface devices)")
+    print("  /device (list toy profiles)  /device <short_name> (set active profile, from devices.json)")
     print("  /upgrade <request>   (e.g. /upgrade add tts)")
     if LOKI_APPLE_CALENDAR and sys.platform == "darwin":
         print("  Time: clock + epoch in system prompt; tool get_current_time")
@@ -4216,6 +5080,14 @@ def main() -> int:
             print(butt.scan())
             continue
 
+        if user_in == "/device" or user_in.startswith("/device "):
+            rest = user_in[len("/device") :].strip()
+            if not rest:
+                print(butt.list_device_profiles())
+            else:
+                print(butt.set_active_device_profile(rest))
+            continue
+
         if user_in == "/persona":
             ensure_persona_template()
             pt = load_persona_instructions()
@@ -4240,9 +5112,10 @@ def main() -> int:
             base_system_static = build_base_system_static(memory_text)
             tail = [m for m in messages if m.get("role") != "system"]
             messages = [{"role": "system", "content": compose_system_with_time(base_system_static)}] + tail
+            uf = f" + user facts {USER_FACTS_PATH.name}" if LOKI_USER_FACTS_ENABLED else ""
             print(
                 f"[memory] Reloaded {MEMORY_DIR} "
-                f"(includes persona {PERSONA_INSTRUCTIONS_PATH.name} + spoken style {SPOKEN_STYLE_PATH.name})"
+                f"(includes persona {PERSONA_INSTRUCTIONS_PATH.name} + spoken style {SPOKEN_STYLE_PATH.name}{uf})"
             )
             continue
 
@@ -4479,7 +5352,7 @@ def main() -> int:
             append_cross_chat_log("loki_direct_cli", user_in, content)
 
     try:
-        butt.stop_device("nora")
+        butt.stop_device()
     except Exception:
         pass
     try:

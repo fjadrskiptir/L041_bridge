@@ -58,7 +58,14 @@ python3 loki_direct.py
 
 - **Web UI (macOS)**: double-click `Start_Loki_GUI.command` to open a basic browser UI with buttons (including Hold-to-Talk and **Camera on / Send with camera**).
   - After starting, open: `http://127.0.0.1:7865`
-  - New: **Stealth toggle** in the control row quickly blurs chat text and dims sensitive panels.
+  - **Phone on same Wi‑Fi (recommended)**:
+    - Set `.env`: `LOKI_WEB_HOST=0.0.0.0` (bind on LAN) and **set an auth token**: `LOKI_WEB_AUTH_TOKEN=some_long_random_string`
+    - Restart Loki, then open on your phone: `http://<your-mac-lan-ip>:7865/?token=<that_token>`
+    - **On the Mac**, `http://127.0.0.1:7865` still works **without** `?token=` (loopback is exempt so the GUI launcher and health checks don’t 401).
+  - **Spaces** (left sidebar): separate **persistent threads** by topic—each has its own saved history under **`memories/chat_threads/`** (gitignored). **Main** (`default`) cannot be deleted; **+ New space** creates a thread; double-click a name to rename; **×** deletes (not Main). **Telegram** (if enabled) uses its **own** persisted thread (default id **`telegram`**, override with **`LOKI_TELEGRAM_THREAD_ID`**). The browser cannot switch into that space; it appears in the list as phone-only. Other spaces still get **cross-space continuity** snippets in the system prompt (budget: **`LOKI_CROSS_SPACE_CONTINUITY_CHARS`**, default `8000`; set `0` to disable) so references across topics still land.
+  - **Reply stance** (under the voice row): **Heart** (full Loki voice), **Mixed** (default), or **Dry** (facts first). Injects a short system block for this session; applies to **both** the active browser space and the Telegram thread. Chat: `/stance` or `/stance heart|mixed|dry`.
+  - **Nightly diary** (optional): set **`LOKI_NIGHTLY_DIARY=1`** in `.env`. While the Web UI is running, a background thread **once per local calendar day** (after **`LOKI_NIGHTLY_DIARY_HOUR` / `MINUTE`**, default 23:45) appends one in-character section to a **single markdown journal** (default **`memories/diary/loki_journal.md`**—all nights stay in that one file, newest at the bottom). Context is built from **`cross_chat_log.jsonl`** for that local date (leave **`LOKI_CROSS_CHAT_LOG=1`**). The **`memories/diary/`** folder is **not** loaded into the automatic memory snapshot. Chat: **`/nightly_diary`** for status. If you already have **`nightly.md`**, set **`LOKI_NIGHTLY_DIARY_PATH=memories/diary/nightly.md`** to keep using it.
+  - **Stealth toggle** in the control row quickly blurs chat text and dims sensitive panels.
 - **Desktop overlay (optional):** double-click `Start_L041_Overlay.command` for a small always-on-top orb that reflects state from `GET /api/presence` (`idle`, `listening`, `thinking`, `speaking`).  
   **Tk note:** Homebrew Python may lack Tk (`ModuleNotFoundError: _tkinter`) — install **`brew install python-tk@VERSION`** to match your `python@VERSION`. **Xcode / Command Line Tools Python** can `import tkinter` but **crash in `TkpInit` (Tcl_Panic)**; the launcher skips those interpreters. Override with **`LOKI_OVERLAY_PYTHON=/path/to/python3`** if needed.
 
@@ -167,12 +174,13 @@ Tools:
 - **`intiface_status`**
 - **`scan_devices`**
 - **`list_devices`**
-- **`vibrate`** (default matches “nora”)
-- **`stop_device`**
+- **`list_device_profiles`** / **`set_active_device_profile`** — toy aliases from **`devices.json`** (e.g. `nora`, `tenera`)
+- **`vibrate`** / **`stop_device`** — optional **`device_profile`** (short name) or **`device_name_contains`** (raw substring); otherwise active profile, then **`INTIFACE_DEVICE_MATCH`**
+- CLI: **`/device`** lists profiles; **`/device tenera`** sets the active default
 
 Notes:
 - `buttplug==1.0.0` requires `await dev.run_output(...)` — Loki Direct implements this.
-- **`devices.json`** (optional registry for some bridges / notes): **not** committed—copy **`devices.example.json`** → **`devices.json`** and edit locally. Git only tracks the example.
+- **`devices.json`** (repo root, **gitignored**): copy **`devices.example.json`** → **`devices.json`** and set **`short_name`** + **`match_strings`** per toy so names like “Lovense Nora” vs “Lovense Tenera” resolve reliably. Optional **`INTIFACE_ACTIVE_DEVICE`** picks the default **`short_name`** when the file has multiple entries; otherwise the first profile in the file is active until you **`set_active_device_profile`** or **`/device …`**.
 
 ---
 
@@ -183,7 +191,8 @@ There are three related layers:
 - **Persona bundle (`memories/persona/`)** — see **`memories/persona/README.md`** for layout.
   - **`instructions.md`**: character, relationship, lore rules, silence/return behavior, Grok-parity cues. Injected every reply; **gitignored** when private. **Template:** copy from **`instructions.example.md`** (repo, AI-oriented wording) then customize section **8. User-specific anchors**.
   - **`spoken_voice.md`**: TTS + chat *delivery* (cadence, British/deep register cues, anti-repetition, anti-bot). Injected every reply.
-  - **Web UI:** **Personality & instructions** → edit → **Save & apply**. **Chat:** `/persona`, `/voice_style`, `/mem`. **Tools:** `read_persona_instructions`, `update_persona_instructions`, `read_spoken_style_instructions`, `update_spoken_style_instructions`.
+  - **`user_facts.md`**: curated **facts about Ness** (preferences, routines, biography, coping patterns she names, etc.). Loki appends via tool **`record_user_fact`** when she shares stable info; injected every reply. **Gitignored.**
+  - **Web UI:** **Personality & instructions** → edit → **Save & apply**. **Chat:** `/persona`, `/voice_style`, `/mem`. **Tools:** `read_persona_instructions`, `update_persona_instructions`, `read_spoken_style_instructions`, `update_spoken_style_instructions`, `record_user_fact`.
 
 ### Brave Leo (custom model) + shared memory with home Loki
 
@@ -234,6 +243,7 @@ Loki watcher will:
 - **`XAI_API_KEY`**: required
 - **`XAI_ENDPOINT`**: default `https://api.x.ai/v1/chat/completions`
 - **`XAI_MODEL`**: default `grok-4-1-fast-reasoning`
+- **Chat sampling (voice vs “safe” tone):** defaults are hotter than the old fixed `0.3` so local Loki sounds less clinical. **`LOKI_CHAT_TEMPERATURE_WITH_TOOLS`** (default `0.72`) applies to normal turns that may call tools; **`LOKI_CHAT_TEMPERATURE_NO_TOOLS`** (default `0.88`) applies to no-tools calls (e.g. OpenAI bridge, plugin JSON generation). **`LOKI_CHAT_TOP_P`** (default `0.95`; set to `0` to omit). If **`LOKI_CHAT_TEMPERATURE`** is set, it overrides both temperatures. For maximum tool reliability at the cost of flatter chat, try `LOKI_CHAT_TEMPERATURE=0.35`.
 
 ### Embeddings / retrieval
 Loki tries xAI embeddings, but will fall back to local hashing embeddings if you don’t have access.
@@ -245,13 +255,33 @@ Loki tries xAI embeddings, but will fall back to local hashing embeddings if you
 ### Web search
 - **`LOKI_WEB_SEARCH`**: `1` (on) / `0` — enable tool `web_search` (DuckDuckGo).
 - **`LOKI_WEB_SEARCH_MAX_RESULTS`**: default `8` (hard cap 15 per call).
+- **`LOKI_WEB_SEARCH_BOND_CONTEXT`**: default `1` — adds system guidance so Loki is likelier to call `web_search` when casual chat clearly depends on **right now** (weather, storms, travel tied to news, etc.), not only when you ask for “research.” Set `0` if you want fewer automatic lookups or faster replies.
 
 ### Webcam (Web UI only)
 Uses **getUserMedia** in the browser (works on **localhost** or HTTPS). Each click of **Send with camera** uploads **one JPEG frame** to Loki; the server runs **xAI vision** (same path as `/attach` images), then Grok replies. Nothing is streamed continuously.
 - **`LOKI_WEBCAM_MAX_MB`**: max decoded image size per frame (default `6`).
 
+### TTS text shaping (ElevenLabs / Piper / say)
+- Loki now applies a **spoken-only** preprocessor before synthesis (does not change the visible chat text): removes markdown noise, replaces URLs with “link”, converts **nonverbal tags** like `[sigh]` into short phonetic cues, and can apply pronunciation dictionaries.
+- **Nonverbal tags** (write them in chat / persona): `[sigh]`, `[hmm]`, `[tch]`, `[tsk]`, `[laugh]`, `[chuckle]`, `[kiss]` (also supports `<sigh/>` forms).
+- **Pronunciation dictionaries**: create `memories/tts_dictionaries/` and add one or more `*.json` files. Each JSON is a map of `"pattern": "replacement"` applied before speech.
+  - Example `memories/tts_dictionaries/es.json`:
+
+```json
+{
+  "corazón": "coh-rah-SON",
+  "Puerto Rico": "Pwehr-toh REE-koh"
+}
+```
+
+  - You can add `pl.json` (Polish), `no.json` (Norwegian), or anything you like; all `*.json` files in that folder are merged.
+- **Env**:
+  - `LOKI_TTS_DICTIONARIES=0` disables dictionary loading.
+  - `LOKI_TTS_DICT_DIR=/path/to/dir` overrides the folder.
+  - `LOKI_TTS_MAX_SPOKEN_CHARS` caps spoken text length (default `2600`).
+
 ### Telegram (Web UI — long polling)
-Your **phone talks to Telegram’s servers**; **`loki_direct_webui.py` on your Mac** long-polls Telegram and runs the **same Loki session** as the browser (shared `messages`, tools, memory). You can open the notification and **reply in the Telegram chat** on LTE/5G — no home Wi‑Fi required on the phone. **The Mac must be on** and the Web UI process running.
+Your **phone talks to Telegram’s servers**; **`loki_direct_webui.py` on your Mac** long-polls Telegram and runs Loki with the **same tools and memory** as the browser, but Telegram chat is stored in its **own** saved thread (see **`LOKI_TELEGRAM_THREAD_ID`**). You can open the notification and **reply in the Telegram chat** on LTE/5G — no home Wi‑Fi required on the phone. **The Mac must be on** and the Web UI process running.
 
 **Important:** **`Start_Loki.command` / `loki_direct.py` (CLI) does not run Telegram.** Only **`loki_direct_webui.py`** (e.g. **Start_Loki_GUI.command**) starts the bot. If messages get no reply, you’re almost certainly on CLI — switch to the Web UI launcher.
 
@@ -270,6 +300,9 @@ Your **phone talks to Telegram’s servers**; **`loki_direct_webui.py` on your M
    - **`LOKI_TELEGRAM=1`**
    - **`TELEGRAM_BOT_TOKEN=...`**
    - **`TELEGRAM_ALLOWED_CHAT_IDS=123456789`** (comma-separated if several)
+   - Optional: **`LOKI_TELEGRAM_THREAD_ID`** — filesystem-safe id for Telegram’s thread file under **`memories/chat_threads/`** (default **`telegram`**; must not be **`default`**).
+   - Optional: **`LOKI_CROSS_SPACE_CONTINUITY_CHARS`** — max characters of **summarized** other-thread context injected into the system prompt (default **`8000`**; **`0`** turns it off).
+   - **One-time history import:** only works when your **`telegram`** thread file is **empty** (no saved `turns` yet). If **`telegram.json` already has messages** (e.g. you chatted from the phone after the split), the importer **does nothing** — the log will say **`skipped — already has saved turns`**. In that case, old chats that only lived under **Main** stay in **`default.json`** until you copy them yourself, or you deliberately back up **`telegram.json`**, clear its **`turns`**, delete **`.telegram_migrated_<id>.json`** if present, and restart once with **`LOKI_TELEGRAM_MIGRATE_CROSS_CHAT=1`** (you’d lose current Telegram-only history in that file unless you merged it back from the backup). Set **`LOKI_TELEGRAM_MIGRATE_CROSS_CHAT=1`** once and restart the Web UI when the thread is empty. Loki rebuilds from **`cross_chat_log.jsonl`** rows whose **`source`** is **`telegram`** or **`telegram_*`** (needs **`LOKI_CROSS_CHAT_LOG=1`**, the default). **`default`** is **not** changed automatically. After a successful import, **`memories/chat_threads/.telegram_migrated_<id>.json`** prevents re-import.
 
 **If he never replies:** set **`LOKI_TELEGRAM_SETUP_HELP=1`**, restart the Web UI, message the bot again — you’ll get a hint with your **chat id** if `.env` doesn’t match (or send **`/myid`**). Turn **`LOKI_TELEGRAM_SETUP_HELP=0`** after setup.
 
@@ -339,6 +372,9 @@ Notes:
 - **`LOKI_PERSONA_DIR`**: default `memories/persona`
 - **`LOKI_PERSONA_INSTRUCTIONS_PATH`**: default `memories/persona/instructions.md`
 - **`LOKI_SPOKEN_STYLE_PATH`**: default `memories/persona/spoken_voice.md`
+- **`LOKI_USER_FACTS_PATH`**: default `memories/persona/user_facts.md`
+- **`LOKI_USER_FACTS_MAX_CHARS`**: default `32000` (cap for how much of `user_facts.md` is injected)
+- **`LOKI_USER_FACTS`**: `1` (on) / `0` — disable **`record_user_fact`** and its prompt block
 - **`LOKI_PERSONA_INSTRUCTIONS_MAX_CHARS`**: default `48000`
 - **`LOKI_INBOX_DIR`**: default `memories/inbox`
 - **`LOKI_PROCESSED_DIR`**: default `memories/processed`
@@ -349,8 +385,20 @@ Notes:
 - **`LOKI_WATCH_MEMORY_FOLDER`**: `1` (on) / `0` (off)
 - **`LOKI_WATCH_POLL_S`**: default `2.0`
 
+### Nightly diary (Web UI only)
+Requires the Web UI process (`loki_direct_webui.py`). One xAI completion per local day after the trigger time; **appends** to **one** markdown file (default **`memories/diary/loki_journal.md`**, gitignored)—not a new file per night. **`memories/diary/`** is excluded from the **`/mem` text snapshot** so the journal does not bloat every prompt.
+- **`LOKI_NIGHTLY_DIARY`**: `0` (off, default) / `1` (on)
+- **`LOKI_NIGHTLY_DIARY_HOUR`**: default `23` (0–23, local wall clock using **`LOKI_TIMEZONE`** if set, else host TZ)
+- **`LOKI_NIGHTLY_DIARY_MINUTE`**: default `45` (0–59)
+- **`LOKI_NIGHTLY_DIARY_PATH`**: default `memories/diary/loki_journal.md` (set to `memories/diary/nightly.md` if you migrated from an older default)
+- **`LOKI_NIGHTLY_DIARY_STATE_PATH`**: default `memories/diary/nightly_state.json` (last successful local date)
+- **`LOKI_NIGHTLY_DIARY_MAX_CONTEXT_CHARS`**: default `18000` (how much of the day’s **`cross_chat_log.jsonl`** to pass in)
+- **`LOKI_NIGHTLY_DIARY_POLL_S`**: default `60` (background check interval)
+
 ### Intiface
 - **`INTIFACE_WS`**: default `ws://127.0.0.1:12345`
+- **`INTIFACE_DEVICE_MATCH`**: fallback substring when **`devices.json`** is missing or has no profiles (default `nora`)
+- **`INTIFACE_ACTIVE_DEVICE`**: optional **`short_name`** to select the default profile when **`devices.json`** lists several toys
 
 ### Networking
 - **`LOKI_HTTP_TIMEOUT_S`**: default `60`
